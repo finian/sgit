@@ -225,6 +225,40 @@ acceptable on a host-only network and nowhere else. `sgit gateway start`
 refuses to bind the wildcard address or the interface carrying your default
 route.
 
+#### Do not open the guest's working tree from the host
+
+The tree is reachable from the host through the shared folder, which makes it
+tempting to open there in an editor. Don't — not an editor with git
+integration, not anything else that watches files and runs git in response.
+
+Such a watcher reacts to the guest writing `.git/index` by spawning git
+processes of its own, dozens of them within a second, each replacing the index
+the ordinary way: write `.git/index.lock`, rename it over `.git/index`. Git's
+own locking holds. The guest's view of the directory does not. Afterwards
+`stat` and `ls` in the guest still report a healthy index while every `open()`
+on it returns ENOENT, through any spelling of the path, and it does not recover
+on its own. Git, finding no index it can open, carries on with an empty one.
+
+What that looks like is a wholesale deletion: `git status` shows every tracked
+file staged for deletion and `git ls-files` prints nothing. Nothing is actually
+gone, and `git reset` rebuilds the index from HEAD — but the state arrives
+silently, and **a commit made in it commits the deletions.** Undo that with
+`git reset --soft HEAD^`, then `git reset`.
+
+Observed on a macOS host and a macOS guest under Apple Virtualization, over a
+virtio-fs share. With an editor open on the host, a loop of `git reset` in the
+guest lost the index within seven iterations; with it closed, 800 forced index
+rewrites lost it none. sgit does not touch a working tree's index after
+creating the tree — all it runs in one is `git config` and `git remote
+set-url` — so this is a property of the arrangement, not something a version of
+sgit fixes. To review the work from the host, read the store, or keep a
+separate clone outside the shared folder.
+
+A share like this has a second and unrelated fault worth knowing about: a file
+written and then mmap'd by the same process can come back with zero length,
+which is enough to fail Rust builds under it with `failed to map object file:
+memory map must have a non-zero length`. Build outside the share.
+
 ### On one machine, with the store out of reach
 
 The middle row of the table above: no virtual machine, one extra account. The
