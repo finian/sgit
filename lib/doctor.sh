@@ -83,6 +83,17 @@ MOUNTS
 	printf '%s' "$besttype"
 }
 
+# The filesystems where "another machine can see this too" is the default.
+# Named in one place because two different things follow from it: a store on a
+# share can be read from the other side, and a working tree on a share can be
+# written from it.
+_doctor_is_shared_fs() {
+	case "$1" in
+	AppleVirtIOFS | virtiofs | nfs | smbfs | cifs | 9p | vboxsf) return 0 ;;
+	esac
+	return 1
+}
+
 doctor_store_placement() {
 	local fstype mode
 
@@ -91,15 +102,12 @@ doctor_store_placement() {
 
 	fstype=$(_doctor_fstype "$SGIT_HOME")
 	d_note "filesystem: ${fstype:-unknown}"
-	case "$fstype" in
-	AppleVirtIOFS | virtiofs | nfs | smbfs | cifs | 9p | vboxsf)
+	if _doctor_is_shared_fs "$fstype"; then
 		d_warn "the store is on a shared filesystem ($fstype); anything that can see the share can read the upstream URL, the real identities and the mapping table"
 		d_note 'move the store to a path private to this machine'
-		;;
-	*)
+	else
 		d_ok 'the store is not on a shared filesystem'
-		;;
-	esac
+	fi
 
 	mode=$(stat -f '%Lp' "$SGIT_HOME" 2>/dev/null || stat -c '%a' "$SGIT_HOME" 2>/dev/null || printf '')
 	if [ -n "$mode" ]; then
@@ -165,7 +173,7 @@ doctor_identity() {
 }
 
 doctor_repo() {
-	local id="$1" v hidden n missing counted transport expected actual
+	local id="$1" v hidden n missing counted transport expected actual wdfs
 	store_use "$id"
 	transport=$(repo_config_get sgit.transport)
 
@@ -234,7 +242,20 @@ doctor_repo() {
 
 	store_workdir_state
 	case "$STORE_WD_STATE" in
-	ok) d_ok "working tree at $STORE_WD" ;;
+	ok)
+		d_ok "working tree at $STORE_WD"
+		# A tree on a share has a second machine able to write it, and
+		# a file watcher over there is enough to leave .git/index
+		# unopenable: git then falls back to an empty index and calls
+		# every tracked file deleted. Whether anything is watching
+		# cannot be seen from here, so this warns on the arrangement.
+		wdfs=$(_doctor_fstype "$STORE_WD")
+		if _doctor_is_shared_fs "$wdfs"; then
+			d_warn "the working tree is on a shared filesystem ($wdfs); an editor or file watcher on the other side of the share can destroy its .git/index"
+			d_note 'the sign is git calling every tracked file deleted while git ls-files prints nothing; git reset rebuilds it'
+			d_note 'keep the tree off the share, or at least never open it from the other side'
+		fi
+		;;
 	missing)
 		d_warn "the working tree recorded at $STORE_WD is gone"
 		d_note "recreate it with: sgit restore $id [<dir>]"
@@ -384,11 +405,58 @@ ok() { printf '  %s[ok]%s   %s\n' "$ok_c" "$off_c" "$*"; }
 warn() { printf '  %s[warn]%s %s\n' "$warn_c" "$off_c" "$*"; problems=$((problems + 1)); }
 note() { printf '  [note] %s\n' "$*"; }
 
+# The filesystem a path sits on: the longest mount point that prefixes it wins.
+# Written out here rather than shelled out to, because the probe has to run
+# where sgit is not installed. Pure shell, and no pipeline: this file defines a
+# `head` of its own, and the loop has to keep state across iterations.
+fstype_of() {
+	_best='' _bt=''
+	while IFS= read -r _line; do
+		case "$_line" in *' on '*) ;; *) continue ;; esac
+		_mp=${_line#* on }
+		_mp=${_mp%% (*}
+		_mp=${_mp%% type *}
+		case "$_line" in
+		*' type '*) _t=${_line#* type }; _t=${_t%% *} ;;
+		*) _t=${_line##*(}; _t=${_t%%,*}; _t=${_t%)} ;;
+		esac
+		# A mount point of "/" would otherwise build the pattern "//*".
+		case "$_mp" in /) _mp='' ;; */) _mp=${_mp%/} ;; esac
+		case "$1/" in
+		"$_mp"/*)
+			if [ "${#_mp}" -ge "${#_best}" ]; then
+				_best=$_mp
+				_bt=$_t
+			fi
+			;;
+		esac
+	done <<MOUNTS
+$(mount 2>/dev/null)
+MOUNTS
+	printf '%s' "$_bt"
+}
+
 git rev-parse --git-dir >/dev/null 2>&1 || {
 	echo 'not inside a git repository' >&2
 	exit 2
 }
 gitdir=$(git rev-parse --absolute-git-dir)
+
+head 'where this tree lives'
+fstype=$(fstype_of "$(pwd -P)")
+note "filesystem: ${fstype:-unknown}"
+case "$fstype" in
+AppleVirtIOFS | virtiofs | nfs | smbfs | cifs | 9p | vboxsf)
+	warn "this tree is on a shared filesystem ($fstype); whatever else mounts the share can read every file in it, and an editor or file watcher on the other side can destroy .git/index"
+	note 'a destroyed index shows as git calling every tracked file deleted'
+	note 'while git ls-files prints nothing; git reset rebuilds it, but a'
+	note 'commit made in that state commits the deletions'
+	note 'keep the tree off the share, or never open it from the other side'
+	;;
+*)
+	ok 'this tree is not on a shared filesystem'
+	;;
+esac
 
 head 'identity used here'
 name=$(git config user.name)

@@ -966,6 +966,15 @@ carries no list of your real identities — it tells you what is there, and you
 decide whether any of it is yours. That is what makes it safe to leave lying
 around in the shadow repository.
 
+Both also report the filesystem they are looking at, and warn when it is a
+shared or network one — `AppleVirtIOFS`, `virtiofs`, `nfs`, `smbfs`, `cifs`,
+`9p`, `vboxsf`. For the store that means it can be read from the other side of
+the share; for a working tree it means the index hazard described in
+[Across a virtual machine](#do-not-open-the-guests-working-tree-from-the-host).
+Neither half can see whether anything is actually watching from over there, so
+the warning is about the arrangement. The probe is the one that reaches a tree
+in a guest the store knows nothing about.
+
 ## How it works
 
 ```

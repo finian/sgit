@@ -240,4 +240,65 @@ case "$out" in
 *) fail 'the probe works with sgit off the PATH' "$out" ;;
 esac
 
+# --- a working tree on a shared filesystem ----------------------------------
+#
+# The arrangement the README warns about: the tree can be written from another
+# machine, and a file watcher over there is enough to leave .git/index
+# unopenable, after which git reads an empty index and calls every tracked file
+# deleted. A test cannot mount a share, so the mount table is fabricated.
+#
+# The tree gets a path of its own, resolved, because the fabricated table is
+# matched by prefix and $TRASH reaches this file by way of a symlink and a
+# doubled slash. The store stays outside that path, which also checks that the
+# two placements are judged separately.
+
+SHARE="$(cd "$TRASH" && pwd -P)/share"
+mkdir -p "$SHARE"
+sgit clone "$UPSTREAM" "$SHARE/tree" >/dev/null 2>&1
+
+mkdir -p "$TRASH/fakebin"
+cat >"$TRASH/fakebin/mount" <<EOF
+#!/bin/sh
+echo '/dev/disk1s1 on / (apfs, local, journaled)'
+echo 'virtio-fs on $SHARE (AppleVirtIOFS, nodev, nosuid, mounted by you)'
+EOF
+chmod +x "$TRASH/fakebin/mount"
+
+out=$(PATH="$TRASH/fakebin:$PATH" sgit doctor 2>&1)
+case "$out" in
+*'the working tree is on a shared filesystem (AppleVirtIOFS)'*)
+	pass 'a working tree on a share is caught' ;;
+*) fail 'a working tree on a share is caught' "$out" ;;
+esac
+case "$out" in
+*'git ls-files prints nothing'*) pass 'and the symptom is named, so it can be recognised' ;;
+*) fail 'and the symptom is named, so it can be recognised' "$out" ;;
+esac
+case "$out" in
+*'the store is not on a shared filesystem'*)
+	pass 'while the store, elsewhere, is judged on its own' ;;
+*) fail 'while the store, elsewhere, is judged on its own' "$out" ;;
+esac
+
+# The probe is what reaches a tree the store cannot see -- the cross-VM case,
+# where the store is on the host and never records a working tree at all.
+out=$(cd "$SHARE/tree" && PATH="$TRASH/fakebin:$PATH" sh "$TRASH/probe.sh" 2>&1)
+case "$out" in
+*'[warn]'*'shared filesystem (AppleVirtIOFS)'*)
+	pass 'and the probe catches it from inside the tree' ;;
+*) fail 'and the probe catches it from inside the tree' "$out" ;;
+esac
+
+# Not every system has mount(8) where the probe can reach it, and a mount table
+# it cannot read is not a finding.
+out=$(cd "$SHARE/tree" && PATH=/usr/bin:/bin sh "$TRASH/probe.sh" 2>&1)
+case "$out" in
+*'filesystem: unknown'*) pass 'an unreadable mount table reports unknown' ;;
+*) fail 'an unreadable mount table reports unknown' "$out" ;;
+esac
+case "$out" in
+*'[warn]'*'shared filesystem'*) fail 'and does not guess' "$out" ;;
+*) pass 'and does not guess' ;;
+esac
+
 test_summary
