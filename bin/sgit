@@ -1,0 +1,954 @@
+#!/usr/bin/env bash
+#
+# sgit -- shadow git
+#
+# Maintains a rewritten copy of a repository whose git identities and origin
+# are hidden, and keeps it in sync with the real one.
+
+set -eu
+
+_sgit_root() {
+	local src="${BASH_SOURCE[0]}" dir
+	while [ -L "$src" ]; do
+		dir=$(cd -P "$(dirname "$src")" && pwd)
+		src=$(readlink "$src")
+		case "$src" in
+		/*) ;;
+		*) src="$dir/$src" ;;
+		esac
+	done
+	cd -P "$(dirname "$src")/.." && pwd
+}
+
+# Captured before lib/common.sh replaces them; see sgit_restore_locale.
+SGIT_CALLER_LC_ALL="${LC_ALL-}"
+SGIT_CALLER_LC_CTYPE="${LC_CTYPE-}"
+SGIT_CALLER_LANG="${LANG-}"
+
+SGIT_ROOT=$(_sgit_root)
+for _m in common config ident rewrite scrub store gateway sync push remote workdir doctor; do
+	# shellcheck source=/dev/null
+	. "$SGIT_ROOT/lib/$_m.sh"
+done
+unset _m
+
+SGIT_VERSION=0.1.0
+
+SGIT_HOME="${SGIT_HOME:-$HOME/.local/share/sgit}"
+SGIT_GLOBAL_CONFIG="${SGIT_GLOBAL_CONFIG:-$SGIT_HOME/config}"
+
+usage() {
+	cat >&2 <<'USAGE'
+usage: sgit [-C <path>] [--id <id>] [--show-upstream] [--debug] <command> [args]
+
+  clone <url> [<dir>]   create a shadow repository from an upstream one
+  init [<dir>]          create a new shadow repository with no upstream
+  sync                  fetch from upstream and rewrite what is new
+  list                  list shadow repositories
+  restore <id> [<dir>]  recreate a working tree from the shadow repository
+  remove <id> [--yes]   delete a store entry, permanently
+  status                show the state of one shadow repository
+  remote [-v] ...       manage the real repository's remotes
+  git <args>...         run git against the real repository, so its path
+                        never has to be looked up. Output is not redacted.
+  config [--global|--repo] <key> [<value>]
+  config [--global|--repo] --add|--replace-all <key> <value>
+  config --list | --unset <key> | --init
+                        read and write sgit's own configuration. Reading prints
+                        every value a key holds; --add appends one.
+  doctor [--probe|--emit-probe]
+                        check the store, or examine a shadow working tree
+  gateway start|restart|stop|status|url [--bootstrap] <id>
+                        run the gateway that serves shadow repositories over
+                        the network
+  gateway fix-workdir-urls [-n] [--script]
+                        point working trees at the address the gateway now
+                        advertises: here by default, or --script to print one
+                        to run where the trees live
+
+  rewrite ...           internal: run the rewrite engine directly
+  pre-receive           internal: the shadow repository's push hook
+
+options for clone and init:
+  --no-workdir          create the store only, not the working tree
+  --print-id            write the new repository's id to stdout
+  --transport helper|gateway   (default: sgit.defaultTransport, else helper)
+USAGE
+	exit 1
+}
+
+# --- repository resolution --------------------------------------------------
+
+# Like resolve_repo, but reports failure instead of ending the process. Used
+# where a repository is optional, such as a configuration read that should fall
+# back to the global file.
+resolve_repo_optional() {
+	local gitdir id
+	if [ -n "${OPT_ID:-}" ]; then
+		store_use "$OPT_ID"
+		[ -d "$SGIT_REPO_DIR" ] || return 1
+		return 0
+	fi
+	gitdir=$(git rev-parse --absolute-git-dir 2>/dev/null) || return 1
+	[ -f "$gitdir/sgit" ] || return 1
+	id=$(cat "$gitdir/sgit")
+	sgit_clear_git_env
+	store_use "$id"
+	[ -d "$SGIT_REPO_DIR" ] || return 1
+	return 0
+}
+
+resolve_repo() {
+	local gitdir id
+	if [ -n "${OPT_ID:-}" ]; then
+		store_require "$OPT_ID"
+		return
+	fi
+	gitdir=$(git rev-parse --absolute-git-dir 2>/dev/null) ||
+		sgit_die "not inside a shadow working tree; pass --id"
+	[ -f "$gitdir/sgit" ] ||
+		sgit_die "$gitdir is not a shadow working tree; pass --id"
+	id=$(cat "$gitdir/sgit")
+	# The working tree has been located; from here on every git command is
+	# aimed at the store and must not inherit its context.
+	sgit_clear_git_env
+	store_require "$id"
+}
+
+# Which transport a new repository gets when --transport is not given.
+#
+# A separate key from sgit.transport, which records what one repository
+# actually uses. Overloading that name would suggest that changing it globally
+# changes existing repositories, and it does not: each keeps the value it was
+# created with. Same reasoning as git's own init.defaultBranch.
+#
+# Read before any store exists, so it can only come from the global file --
+# which is the only place it would make sense anyway.
+default_transport() {
+	local t
+	t=$(_config_one sgit.defaultTransport)
+	printf '%s' "${t:-helper}"
+}
+
+# Fail before anything is created rather than after. Resolving the gateway
+# address needs no store, so there is no reason to discover a missing
+# gateway.advertise only once the mirror has been fetched.
+validate_transport() {
+	case "$1" in
+	helper) ;;
+	gateway) gateway_resolve_advertise ;;
+	*) sgit_die "unknown transport: $1 (expected helper or gateway)" ;;
+	esac
+}
+
+# --- commands ---------------------------------------------------------------
+
+cmd_clone() {
+	local url="" dir="" no_workdir=no transport="" head="" upname="" print_id=no
+
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--no-workdir) no_workdir=yes; shift ;;
+		--print-id) print_id=yes; shift ;;
+		--transport) transport="$2"; shift 2 ;;
+		--) shift; break ;;
+		-*) sgit_die "unknown option: $1" ;;
+		*) break ;;
+		esac
+	done
+	[ $# -ge 1 ] || sgit_die "usage: sgit clone <url> [<dir>]"
+	url="$1"
+	dir="${2:-}"
+
+	# Kept even when the user names the directory: it is what the warning at
+	# the end compares against.
+	upname="${url%/}"
+	upname="${upname##*/}"
+	upname="${upname%.git}"
+	if [ -z "$dir" ] && [ "$no_workdir" = no ]; then
+		dir="$upname"
+	fi
+	[ -z "$dir" ] || [ ! -e "$dir" ] || sgit_die "$dir already exists"
+
+	sgit_config_load
+	transport="${transport:-$(default_transport)}"
+	validate_transport "$transport"
+	store_ensure_home
+	store_use "$(store_new_id)"
+	mkdir -p "$SGIT_REPO_DIR"
+	# Until the whole thing succeeds, a half-built store is worse than none,
+	# and so is a half-built working tree.
+	sgit_cleanup_add "$SGIT_REPO_DIR"
+	[ "$no_workdir" = yes ] || sgit_cleanup_add "$dir"
+
+	git init -q --bare "$SGIT_REAL"
+	git -C "$SGIT_REAL" remote add origin "$url"
+	git -C "$SGIT_REAL" config remote.origin.fetch '+refs/heads/*:refs/heads/*'
+	git -C "$SGIT_REAL" config --add remote.origin.fetch '+refs/tags/*:refs/tags/*'
+	git -C "$SGIT_REAL" fetch --quiet --prune origin ||
+		sgit_die "cannot fetch from $url"
+
+	head=$(git ls-remote --symref "$url" HEAD 2>/dev/null |
+		awk '$1 == "ref:" { print $2; exit }') || head=""
+	if [ -z "$head" ]; then
+		head=$(git -C "$SGIT_REAL" for-each-ref --count=1 \
+			--format='%(refname)' refs/heads)
+	fi
+	[ -z "$head" ] || git -C "$SGIT_REAL" symbolic-ref HEAD "$head"
+
+	store_write_config "$transport" "$([ "$no_workdir" = yes ] || printf '%s' "$(cd "$(dirname "$dir")" && pwd)/$(basename "$dir")")"
+	repo_config upstream.fetchRemote origin
+	repo_config upstream.pushRemote origin
+	store_init_shadow "$transport"
+	store_reject_unsupported
+	sync_down
+
+	if [ "$no_workdir" = no ]; then
+		workdir_populate "$dir"
+		workdir_finish "$dir"
+	fi
+
+	sgit_cleanup_drop "$SGIT_REPO_DIR"
+	sgit_cleanup_drop "$dir"
+	report_created "$dir" "$no_workdir" "$upname"
+	# Everything else this command says goes to stderr, so a caller that
+	# asked for the id gets it on stdout with nothing around it.
+	[ "$print_id" = no ] || printf '%s\n' "$SGIT_ID"
+}
+
+cmd_init() {
+	local dir="" no_workdir=no transport="" branch=main print_id=no
+
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--no-workdir) no_workdir=yes; shift ;;
+		--print-id) print_id=yes; shift ;;
+		--transport) transport="$2"; shift 2 ;;
+		-b) branch="$2"; shift 2 ;;
+		--) shift; break ;;
+		-*) sgit_die "unknown option: $1" ;;
+		*) break ;;
+		esac
+	done
+	dir="${1:-}"
+	if [ -z "$dir" ] && [ "$no_workdir" = no ]; then
+		dir="$PWD"
+	fi
+	[ -z "$dir" ] || [ ! -d "$dir/.git" ] || sgit_die "$dir is already a git repository"
+
+	sgit_config_load
+	transport="${transport:-$(default_transport)}"
+	validate_transport "$transport"
+	store_ensure_home
+	store_use "$(store_new_id)"
+	mkdir -p "$SGIT_REPO_DIR"
+	sgit_cleanup_add "$SGIT_REPO_DIR"
+	if [ "$no_workdir" = no ] && [ ! -e "$dir" ]; then
+		sgit_cleanup_add "$dir"
+	fi
+
+	# No remote: the repository starts local-only, and a push from the shadow
+	# side goes no further than here until `sgit remote add` gives it an
+	# upstream (spec G5 exception).
+	git init -q --bare "$SGIT_REAL"
+	git -C "$SGIT_REAL" symbolic-ref HEAD "refs/heads/$branch"
+
+	store_write_config "$transport" "$([ "$no_workdir" = yes ] || printf '%s' "$dir")"
+	store_init_shadow "$transport"
+	sync_down
+
+	if [ "$no_workdir" = no ]; then
+		mkdir -p "$dir"
+		workdir_populate "$dir"
+		workdir_finish "$dir"
+	fi
+
+	sgit_cleanup_drop "$SGIT_REPO_DIR"
+	sgit_cleanup_drop "$dir"
+	report_created "$dir" "$no_workdir" ""
+	[ "$print_id" = no ] || printf '%s\n' "$SGIT_ID"
+}
+
+cmd_sync() {
+	resolve_repo
+	sgit_config_load
+	sync_down
+	sgit_warn "synchronised $SGIT_ID"
+}
+
+cmd_list() {
+	local id upstream mode wd
+	printf '%-18s %-11s %-24s %s\n' ID MODE UPSTREAM WORKDIR
+	while read -r id; do
+		[ -n "$id" ] || continue
+		store_use "$id"
+		upstream=$(store_upstream_url)
+		if [ -n "$upstream" ]; then
+			mode=upstream
+			upstream=$(store_redact "$upstream")
+		else
+			mode=local-only
+			upstream='-'
+		fi
+		store_workdir_state
+		case "$STORE_WD_STATE" in
+		ok) wd="$STORE_WD" ;;
+		missing) wd="$STORE_WD  (gone -- sgit restore $id)" ;;
+		foreign) wd="$STORE_WD  (not a shadow working tree any more)" ;;
+		none) wd='-  (none created here)' ;;
+		esac
+		printf '%-18s %-11s %-24s %s\n' "$id" "$mode" "$upstream" "$wd"
+	done <<IDS
+$(store_list_ids)
+IDS
+}
+
+cmd_status() {
+	local upstream mapped last
+	resolve_repo
+	upstream=$(store_upstream_url)
+	mapped=$(git -C "$SGIT_SHADOW" for-each-ref --format='x' refs/sgit/map | wc -l | tr -d ' ')
+	last=$(repo_config_get sync.lastRun)
+
+	printf 'id           %s\n' "$SGIT_ID"
+	printf 'transport    %s\n' "$(repo_config_get sgit.transport)"
+	if [ -n "$upstream" ]; then
+		printf 'mode         upstream\n'
+		printf 'upstream     %s\n' "$(store_redact "$upstream")"
+	else
+		printf 'mode         local-only (a push goes no further than the real repository)\n'
+	fi
+	printf 'workdir      %s\n' "$(repo_config_get sgit.workdir)"
+	printf 'mapped       %s object(s)\n' "$mapped"
+	if [ -n "$last" ]; then
+		printf 'last sync    %s\n' "$(date -r "$last" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || printf '%s' "$last")"
+	else
+		printf 'last sync    never\n'
+	fi
+	printf 'branches     %s\n' \
+		"$(git -C "$SGIT_SHADOW" for-each-ref --format='x' refs/heads | wc -l | tr -d ' ')"
+}
+
+report_created() {
+	local dir="$1" no_workdir="$2" upname="$3" base
+	printf 'created shadow repository %s\n' "$SGIT_ID" >&2
+	if [ "$no_workdir" = yes ]; then
+		printf 'no working tree was created; run `sgit gateway url %s` for the clone URL\n' \
+			"$SGIT_ID" >&2
+	else
+		workdir_remote_url
+		printf 'working tree  %s\n' "$dir" >&2
+		printf 'remote        %s\n' "$WORKDIR_URL" >&2
+		printf 'identity      %s <%s>\n' "$SGIT_SHADOW_NAME" "$SGIT_SHADOW_EMAIL" >&2
+		# What matters is the name, not who chose it: a directory called
+		# after the upstream names the real repository even though nothing
+		# else here does, whether sgit defaulted to it or the user asked
+		# for it. A name the user picked instead is theirs to judge, and
+		# saying nothing is the point of having picked one.
+		base="${dir%/}"
+		base="${base##*/}"
+		if [ -n "$upname" ] && [ "$base" = "$upname" ]; then
+			sgit_warn "the directory name matches the upstream repository and is not hidden; rename it if that matters"
+		fi
+	fi
+}
+
+# Run git against the real repository.
+#
+# The mirror is an ordinary git repository; the only awkward thing about it is
+# its path, which is built from a random id and buried in the store. This
+# removes any need to know it:
+#
+#     sgit git config user.email you@work.example
+#     sgit git log --oneline -5
+#     sgit --id 7f3a1c92e4b08d16 git remote -v
+#
+# Everything after `git` is handed to git untouched, and git's exit status is
+# this command's. Output is deliberately *not* redacted: the point is to look
+# at the real repository, so it shows real identities and the real URL.
+# Settings that only make sense in one of the two files. Writing them to the
+# other is not an error -- it is simply read by nobody -- so this warns rather
+# than refuses.
+config_scope_hint() {
+	local key="$1" scope="$2"
+	case "$key" in
+	gateway.*)
+		if [ "$scope" = repo ]; then
+			sgit_warn "$key is read from the global file; a per-repository value has no effect"
+		fi
+		;;
+	sgit.transport)
+		if [ "$scope" = global ]; then
+			sgit_warn "sgit.transport records what one repository uses; to choose what new ones get, set sgit.defaultTransport"
+		fi
+		;;
+	sgit.defaultTransport)
+		if [ "$scope" = repo ]; then
+			sgit_warn "sgit.defaultTransport is consulted when a repository is created, before this file exists; a per-repository value has no effect"
+		fi
+		;;
+	upstream.* | sgit.workdir | sgit.created | sync.lastRun)
+		if [ "$scope" = global ]; then
+			sgit_warn "$key belongs to a single repository; a global value has no effect"
+		fi
+		;;
+	esac
+	return 0
+}
+
+# Say what a change to the gateway does not do by itself.
+#
+# git daemon takes its address and port as start-up arguments, so those two
+# only take effect on a restart; the allowlist and the push switch are read by
+# the access hook on every connection and need none. And any of the three that
+# feed the advertised address leave existing working trees pointing at where
+# the gateway used to be.
+config_after_write() {
+	local key="$1" repos
+	case "$key" in
+	gateway.listen | gateway.port)
+		if gateway_running_pid >/dev/null 2>&1; then
+			sgit_warn "the gateway is running with the previous value; apply it with: sgit gateway restart"
+		fi
+		;;
+	esac
+	case "$key" in
+	gateway.listen | gateway.port | gateway.advertise)
+		repos=$(gateway_repo_count)
+		if [ "${repos:-0}" -gt 0 ]; then
+			sgit_warn "$repos repository(ies) use the gateway transport; their working trees still hold the old URL -- correct them with: sgit gateway fix-workdir-urls"
+		fi
+		;;
+	esac
+	return 0
+}
+
+config_list_file() {
+	local label="$1" file="$2"
+	[ -f "$file" ] || return 0
+	printf '# %s (%s)\n' "$label" "$file"
+	git config -f "$file" --list 2>/dev/null | sed 's/^/  /'
+}
+
+# Read and write sgit's own configuration.
+#
+# There are two files: one global, one per shadow repository. Which one is
+# meant is stated rather than guessed, because unlike git's config files these
+# are not sitting in front of you. Writes default to the global file, which is
+# where nearly everything lives; reads without a scope answer the more useful
+# question -- what value is actually in effect.
+cmd_config() {
+	local scope='' action='' key='' value='' file='' name='' email='' have_value=no existing
+
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--global) scope=global; shift ;;
+		--repo | --local) scope=repo; shift ;;
+		--unset) action=unset; shift ;;
+		--add) action=add; shift ;;
+		--replace-all) action=replace; shift ;;
+		--list | -l) action=list; shift ;;
+		--init) action=init; shift ;;
+		--name) name="$2"; shift 2 ;;
+		--email) email="$2"; shift 2 ;;
+		--) shift; break ;;
+		-*) sgit_die "unknown option: $1" ;;
+		*) break ;;
+		esac
+	done
+
+	if [ "$action" = init ]; then
+		sgit_config_write_minimal "${name:-$SGIT_DEFAULT_SHADOW_NAME}" \
+			"${email:-$SGIT_DEFAULT_SHADOW_EMAIL}"
+		return 0
+	fi
+
+	if [ "$action" = list ]; then
+		if [ "$scope" != repo ]; then
+			config_list_file 'global' "$SGIT_GLOBAL_CONFIG"
+		fi
+		if [ "$scope" = repo ]; then
+			resolve_repo
+			config_list_file "repository $SGIT_ID" "$SGIT_REPO_CONFIG"
+		elif [ -z "$scope" ] && resolve_repo_optional; then
+			config_list_file "repository $SGIT_ID" "$SGIT_REPO_CONFIG"
+		fi
+		return 0
+	fi
+
+	[ $# -ge 1 ] || sgit_die "usage: sgit config [--global|--repo] <key> [<value>]"
+	key="$1"
+	shift
+	if [ $# -ge 1 ]; then
+		value="$1"
+		have_value=yes
+	fi
+
+	case "$action" in
+	add | replace)
+		[ "$have_value" = yes ] || sgit_die "usage: sgit config --$action <key> <value>"
+		;;
+	esac
+
+	# A read with no scope answers "what is in effect here", which is what
+	# the tool itself would see. Several keys hold more than one value --
+	# real.email, real.name, gateway.allowFrom, rewrite.trailerTokens -- and
+	# showing only the first hides configuration the tool is acting on.
+	if [ "$action" = '' ] && [ "$have_value" = no ] && [ -z "$scope" ]; then
+		resolve_repo_optional || SGIT_REPO_CONFIG=''
+		value=$(_config_all "$key")
+		# Same contract as `git config <key>`: unset is a failure, not an
+		# empty line, so a shell test on it behaves as expected.
+		[ -n "$value" ] || sgit_die "$key is not set"
+		printf '%s\n' "$value"
+		return 0
+	fi
+
+	case "${scope:-global}" in
+	repo)
+		resolve_repo
+		file="$SGIT_REPO_CONFIG"
+		;;
+	global)
+		store_ensure_home
+		file="$SGIT_GLOBAL_CONFIG"
+		;;
+	esac
+	config_scope_hint "$key" "${scope:-global}"
+
+	case "$action" in
+	unset)
+		# Removes every value, which is the useful thing for the keys that
+		# hold several. Removing one is as much a change as writing one:
+		# the value falls back to a default, and that default may differ
+		# from what the gateway is running with.
+		git config -f "$file" --unset-all "$key" ||
+			sgit_die "$key is not set in $file"
+		config_after_write "$key"
+		return 0
+		;;
+	add)
+		git config -f "$file" --add "$key" "$value" ||
+			sgit_die "cannot add to $key in $file"
+		config_after_write "$key"
+		return 0
+		;;
+	replace)
+		git config -f "$file" --replace-all "$key" "$value" ||
+			sgit_die "cannot write $key to $file"
+		config_after_write "$key"
+		return 0
+		;;
+	esac
+
+	if [ "$have_value" = yes ]; then
+		# git refuses to collapse several values into one, and says so in
+		# terms of regexps. Answer in terms of the two things that are
+		# actually meant here.
+		existing=$(git config -f "$file" --get-all "$key" 2>/dev/null | wc -l | tr -d ' ')
+		if [ "${existing:-0}" -gt 1 ]; then
+			sgit_die "$key already holds $existing values; use --add to append one, or --replace-all to replace them all"
+		fi
+		git config -f "$file" "$key" "$value" ||
+			sgit_die "cannot write $key to $file"
+		config_after_write "$key"
+		return 0
+	fi
+	git config -f "$file" --get-all "$key" || sgit_die "$key is not set in $file"
+}
+
+# `git config` aimed at somewhere other than a repository.
+#
+# --global and --system name files that belong to the account, and --file names
+# one outright; none of the three is a question about a repository, and git
+# answers them the same wherever it is run.
+_git_outside_any_repo() {
+	[ "${1:-}" = config ] || return 1
+	shift
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--global | --system | --file | --file=* | -f) return 0 ;;
+		esac
+		shift
+	done
+	return 1
+}
+
+cmd_git() {
+	# Requiring a shadow working tree for a command that is not about one
+	# only stands in the way -- and it stands in the way at exactly the
+	# wrong moment, because setting up the account's own git identity and
+	# credentials is the first thing done through this command in the
+	# separate-user deployment, when no repository exists yet.
+	if _git_outside_any_repo "$@"; then
+		sgit_restore_locale
+		exec git "$@"
+	fi
+
+	resolve_repo
+	# The output belongs to the user, so it is rendered in the user's locale,
+	# not in the C locale sgit works in.
+	sgit_restore_locale
+	# exec, so that the exit status, stdin, stdout and stderr are git's own
+	# rather than an approximation of them.
+	exec git -C "$SGIT_REAL" "$@"
+}
+
+# Recreate a working tree from the shadow repository.
+#
+# Everything a working tree is made of lives in shadow.git, so losing one costs
+# nothing that was pushed to it. What it does not hold is work that never left
+# the old tree: commits made but not pushed, and anything uncommitted. Those
+# are gone, and saying so is part of the job.
+cmd_restore() {
+	local id="${1:-${OPT_ID:-}}" dir=''
+	[ $# -eq 0 ] || shift
+	[ -n "$id" ] || sgit_die "usage: sgit restore <id> [<dir>]  (sgit list shows the ids)"
+	store_require "$id"
+	sgit_config_load
+	# Needed by the leak check, and it costs nothing: it reads git's own
+	# configuration rather than the network.
+	sgit_identity_resolve "$SGIT_REAL"
+
+	dir="${1:-$(repo_config_get sgit.workdir)}"
+	[ -n "$dir" ] ||
+		sgit_die "no working tree path is recorded for $id; give one: sgit restore $id <dir>"
+	if [ -e "$dir" ]; then
+		sgit_die "$dir already exists; move it aside or name another directory"
+	fi
+
+	sgit_cleanup_add "$dir"
+	workdir_populate "$dir"
+	workdir_finish "$dir"
+	sgit_cleanup_drop "$dir"
+	repo_config sgit.workdir "$(cd "$(dirname "$dir")" && pwd)/$(basename "$dir")"
+
+	printf 'restored the working tree of %s at %s\n' "$id" "$dir" >&2
+	workdir_remote_url
+	printf 'remote        %s\n' "$WORKDIR_URL" >&2
+	sgit_warn "this is what the shadow repository held; commits that were never pushed to it, and anything uncommitted, are not here"
+	sgit_warn "run 'sgit sync' to pick up whatever the upstream has since gained"
+}
+
+# Destroy a shadow repository's store entry.
+#
+# Irreversible, and how much is lost depends on where the history also exists.
+cmd_remove() {
+	local id="${1:-${OPT_ID:-}}" yes=no arg local_only=no
+	for arg in "$@"; do
+		case "$arg" in
+		--yes | -y) yes=yes ;;
+		esac
+	done
+	case "$id" in
+	--yes | -y) id="${OPT_ID:-}" ;;
+	esac
+	[ -n "$id" ] || sgit_die "usage: sgit remove <id> [--yes]  (sgit list shows the ids)"
+	store_require "$id"
+
+	[ -n "$(repo_config_get upstream.fetchRemote)" ] || local_only=yes
+	store_workdir_state
+
+	printf 'About to delete the store entry for %s.\n\n' "$id" >&2
+	printf 'This removes the real mirror, the shadow repository and the mapping\n' >&2
+	printf 'between them. It cannot be undone.\n\n' >&2
+
+	if [ "$local_only" = yes ]; then
+		printf '  * This repository has no upstream, so the copy being deleted is\n' >&2
+		printf '    the only one there is. Its history cannot be fetched back from\n' >&2
+		printf '    anywhere.\n' >&2
+	else
+		printf '  * The upstream still has the history, so it can be cloned again --\n' >&2
+		printf '    but the mapping goes with this, and a fresh clone rewrites to\n' >&2
+		printf '    different object ids. No existing working tree will fit it.\n' >&2
+	fi
+	case "$STORE_WD_STATE" in
+	ok)
+		printf '  * The working tree at %s is left in place, and its remote\n' "$STORE_WD" >&2
+		printf '    stops working.\n' >&2
+		;;
+	esac
+	printf '\n' >&2
+
+	if [ "$yes" != yes ]; then
+		if [ "$local_only" = yes ]; then
+			sgit_confirm_word "$id" ||
+				sgit_die "not confirmed; nothing was deleted"
+		else
+			sgit_confirm 'Delete it?' ||
+				sgit_die "not confirmed; nothing was deleted"
+		fi
+	fi
+
+	rm -rf "$SGIT_REPO_DIR" || sgit_die "cannot remove $SGIT_REPO_DIR"
+	printf 'deleted %s\n' "$id" >&2
+	case "$STORE_WD_STATE" in
+	ok) sgit_warn "$STORE_WD is now an ordinary git repository whose remote points nowhere" ;;
+	esac
+}
+
+cmd_doctor() {
+	local mode=store dir=''
+
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--emit-probe) mode=emit; shift ;;
+		--probe) mode=probe; shift ;;
+		-*) sgit_die "unknown option: $1" ;;
+		*) dir="$1"; shift ;;
+		esac
+	done
+
+	case "$mode" in
+	emit)
+		doctor_probe_text
+		;;
+	probe)
+		# A convenience for the same-machine case; elsewhere the probe has to
+		# travel to the working tree, which is what --emit-probe is for.
+		sgit_tmpdir_init
+		doctor_probe_text >"$SGIT_TMPDIR/probe.sh"
+		( cd "${dir:-.}" && sh "$SGIT_TMPDIR/probe.sh" )
+		;;
+	store)
+		sgit_config_load
+		doctor_store_side
+		;;
+	esac
+}
+
+cmd_remote() {
+	local sub
+
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		-v | --verbose) SGIT_REMOTE_VERBOSE=yes; shift ;;
+		*) break ;;
+		esac
+	done
+
+	resolve_repo
+	sub="${1:-list}"
+	[ $# -eq 0 ] || shift
+
+	case "$sub" in
+	list)
+		if [ "${SGIT_REMOTE_VERBOSE:-no}" = yes ]; then
+			if [ -n "${SGIT_SHOW_UPSTREAM:-}" ]; then
+				sgit_warn "revealing upstream URLs; keep this output away from anything that reads the shadow repository"
+			else
+				sgit_warn "URLs are redacted; pass --show-upstream to reveal them"
+			fi
+		fi
+		remote_list
+		;;
+	add)
+		[ $# -eq 2 ] || sgit_die "usage: sgit remote add <name> <url>"
+		remote_add "$1" "$2"
+		;;
+	set-url)
+		[ $# -eq 2 ] || sgit_die "usage: sgit remote set-url <name> <url>"
+		remote_set_url "$1" "$2"
+		;;
+	rename)
+		[ $# -eq 2 ] || sgit_die "usage: sgit remote rename <old> <new>"
+		remote_rename "$1" "$2"
+		;;
+	remove | rm)
+		[ $# -eq 1 ] || sgit_die "usage: sgit remote remove <name>"
+		remote_remove "$1"
+		;;
+	set-fetch)
+		[ $# -eq 1 ] || sgit_die "usage: sgit remote set-fetch <name>"
+		remote_set_target fetch "$1"
+		;;
+	set-push)
+		[ $# -eq 1 ] || sgit_die "usage: sgit remote set-push <name>"
+		remote_set_target push "$1"
+		;;
+	*) sgit_die "usage: sgit remote [-v] [add|set-url|rename|remove|set-fetch|set-push] ..." ;;
+	esac
+}
+
+cmd_gateway() {
+	local sub="${1:-status}" force=no foreground=no dry=no script=no
+	[ $# -eq 0 ] || shift
+
+	case "$sub" in
+	start | restart)
+		while [ $# -gt 0 ]; do
+			case "$1" in
+			--listen) SGIT_OPT_LISTEN="$2"; shift 2 ;;
+			--port) SGIT_OPT_PORT="$2"; shift 2 ;;
+			--foreground) foreground=yes; shift ;;
+			--force-listen) force=yes; shift ;;
+			*) sgit_die "unknown option: $1" ;;
+			esac
+		done
+		if [ "$sub" = restart ] && gateway_running_pid >/dev/null 2>&1; then
+			gateway_stop
+		fi
+		gateway_start "$force" "$foreground"
+		;;
+	stop) gateway_stop ;;
+	status) gateway_status ;;
+	url) cmd_gateway_url "$@" ;;
+	fix-workdir-urls)
+		while [ $# -gt 0 ]; do
+			case "$1" in
+			-n | --dry-run) dry=yes; shift ;;
+			--script) script=yes; shift ;;
+			*) sgit_die "unknown option: $1" ;;
+			esac
+		done
+		sgit_config_load
+		if [ "$script" = yes ]; then
+			[ "$dry" = no ] ||
+				sgit_die "--dry-run does not apply to --script; the script is printed, not run"
+			gateway_workdir_url_script "$OPT_ID"
+		else
+			gateway_fix_workdir_urls "$dry" "$OPT_ID"
+		fi
+		;;
+	*) sgit_die "usage: sgit gateway start|restart|stop|status|url|fix-workdir-urls" ;;
+	esac
+}
+
+# Print what a machine on the other side of the gateway needs in order to
+# create the shadow working tree. The snippet is deliberately self-contained:
+# sgit is not installed there, and it must carry no real identity and no
+# upstream (spec 7.4).
+cmd_gateway_url() {
+	local id='' url bootstrap_only=no
+
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		# For a caller that is going to run the script rather than read
+		# it: nothing but the script reaches stdout, so no line has to be
+		# stripped off the front and no format has to be guessed at.
+		--bootstrap) bootstrap_only=yes; shift ;;
+		--) shift; break ;;
+		-*) sgit_die "unknown option: $1" ;;
+		*) break ;;
+		esac
+	done
+	id="${1:-${OPT_ID:-}}"
+	[ -n "$id" ] || sgit_die "usage: sgit gateway url [--bootstrap] <id>"
+	store_require "$id"
+	sgit_config_load
+	gateway_resolve_advertise
+	url="git://$GATEWAY_ADVERTISE/$SGIT_ID/shadow.git"
+
+	if [ ! -f "$SGIT_SHADOW/git-daemon-export-ok" ]; then
+		sgit_warn "this repository is not exported; it was created with the helper transport"
+	fi
+	# This command exists to hand a URL to another machine, so a loopback
+	# address is worth questioning -- though it is exactly right when the
+	# other "machine" is another account on this one.
+	if _gateway_is_loopback "${GATEWAY_ADVERTISE%:*}"; then
+		sgit_warn "this address is only reachable from this machine; if the working tree will live elsewhere, set gateway.advertise to an address that machine can reach"
+	fi
+
+	[ "$bootstrap_only" = yes ] || printf '%s\n' "$url"
+	cat <<BOOTSTRAP
+
+# Run this where the shadow working tree should live. It needs git only.
+set -e
+dir="\${1:-project}"
+git clone '$url' "\$dir"
+cd "\$dir"
+git config user.name '$SGIT_SHADOW_NAME'
+git config user.email '$SGIT_SHADOW_EMAIL'
+git config commit.gpgSign false
+git config tag.gpgSign false
+printf '%s\n' '$SGIT_ID' > .git/sgit
+# What this tree was pointed at, so that a later run of
+# sgit gateway fix-workdir-urls --script can tell a URL sgit wrote from one
+# set here on purpose. (No backticks here: this heredoc is expanded.)
+printf '%s\n' '$url' > .git/sgit-url
+cat > .git/hooks/pre-push <<'SGIT_PRE_PUSH'
+BOOTSTRAP
+	workdir_pre_push_hook_text
+	cat <<'BOOTSTRAP_TAIL'
+SGIT_PRE_PUSH
+chmod +x .git/hooks/pre-push
+rm -rf .git/logs .git/FETCH_HEAD
+BOOTSTRAP_TAIL
+}
+
+# Runs as the shadow repository's pre-receive hook. Until the upward path
+# exists, refusing is the only safe answer: a push accepted here would advance
+# the shadow refs while the real repository stayed behind.
+cmd_pre_receive() {
+	store_require "$OPT_ID"
+	push_pre_receive
+}
+
+cmd_rewrite() {
+	local real="" shadow="" direction="" tags=no
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--real) real="$2"; shift 2 ;;
+		--shadow) shadow="$2"; shift 2 ;;
+		--direction) direction="$2"; shift 2 ;;
+		--tags) tags=yes; shift ;;
+		--) shift; break ;;
+		-*) sgit_die "unknown option: $1" ;;
+		*) break ;;
+		esac
+	done
+	[ -n "$real" ] || sgit_die "--real is required"
+	[ -n "$shadow" ] || sgit_die "--shadow is required"
+	[ -n "$direction" ] || sgit_die "--direction is required"
+
+	sgit_config_load
+	sgit_rewrite "$real" "$shadow" "$direction" "$@"
+	if [ "$tags" = yes ]; then
+		sgit_rewrite_tags "$real" "$shadow" "$direction"
+	fi
+}
+
+# --- entry point ------------------------------------------------------------
+
+OPT_ID=""
+while [ $# -gt 0 ]; do
+	case "$1" in
+	-C) cd "$2" || exit 1; shift 2 ;;
+	--id) OPT_ID="$2"; shift 2 ;;
+	--show-upstream) SGIT_SHOW_UPSTREAM=1; shift ;;
+	--debug) SGIT_DEBUG=1; shift ;;
+	-h | --help) usage ;;
+	--version) printf 'sgit %s\n' "$SGIT_VERSION"; exit 0 ;;
+	--) shift; break ;;
+	*) break ;;
+	esac
+done
+
+[ $# -gt 0 ] || usage
+cmd="$1"
+shift
+
+# The hooks and the daemon callback speak to git, not to a person.
+case "$cmd" in
+pre-receive | gateway-access) ;;
+*) SGIT_INTERACTIVE=1 ;;
+esac
+
+case "$cmd" in
+clone) cmd_clone "$@" ;;
+init) cmd_init "$@" ;;
+sync) cmd_sync "$@" ;;
+list) cmd_list "$@" ;;
+status) cmd_status "$@" ;;
+restore) cmd_restore "$@" ;;
+remove) cmd_remove "$@" ;;
+config) cmd_config "$@" ;;
+git) cmd_git "$@" ;;
+doctor) cmd_doctor "$@" ;;
+remote) cmd_remote "$@" ;;
+gateway) cmd_gateway "$@" ;;
+gateway-access) gateway_access_hook "$@" ;;
+pre-receive) cmd_pre_receive "$@" ;;
+rewrite) cmd_rewrite "$@" ;;
+*) sgit_die "unknown command: $cmd" ;;
+esac

@@ -1,0 +1,743 @@
+#!/bin/sh
+# Set up the separate-account deployment (README: "On one machine, with the
+# store out of reach").
+#
+# What that arrangement is: a service account owns the store and runs the
+# gateway on 127.0.0.1; you work as yourself against a git:// URL. Your agent
+# runs as you, and as you it cannot read the store, the upstream URL, or your
+# credentials.
+#
+# Doing it by hand is six steps across two operating systems, and the one that
+# matters most -- `sudo -H`, so that HOME is the service account's -- is the
+# easiest to leave out, and leaving it out puts the store in your own home
+# where the agent can read it. That is what this script is for.
+#
+# It does not need to run as root; it asks for sudo where it needs it, so that
+# your own git identity is still readable when it configures the account.
+
+set -eu
+
+SELF=$(basename "$0")
+HERE=$(cd "$(dirname "$0")/.." && pwd)
+
+USERNAME=sgit
+HOMEDIR=''
+LIBDIR=/usr/local/lib/sgit
+WRAPPER=/usr/local/bin/as-sgit
+SHADOW_NAME=''
+SHADOW_EMAIL=''
+REAL_NAME=''
+REAL_EMAIL=''
+IDENTITY_GIVEN=no
+REAL_GIVEN=no
+INSTALLED=no
+CLONE_URL=''
+DRY=no
+ASSUME_YES=no
+ACTION=install
+PRINT_WHAT=''
+
+PLIST=/Library/LaunchDaemons/local.sgit.gateway.plist
+UNIT=/etc/systemd/system/sgit-gateway.service
+SERVICE_FILE=''
+
+usage() {
+	cat <<USAGE
+usage: $SELF [options]
+       $SELF --uninstall [options]
+       $SELF --print plist|service|wrapper
+
+Sets up the separate-account deployment: a service account that owns the store
+and runs the gateway, and an \`as-sgit\` command for the few things you still
+do on that side.
+
+  --name <name>         the pseudonym commits are made under
+  --email <email>       its address
+  --real-name <name>    the identity to hide (default: your git user.name)
+  --real-email <email>  (default: your git user.email)
+  --clone <url>         do the first clone at the end -- store and working
+                        tree both -- while you are here to answer anything the
+                        credentials ask. The tree lands in the current
+                        directory, named after the URL
+  --user <name>         the service account (default: $USERNAME)
+  --home <dir>          its home, which is where the store lives
+                        (default: /var/sgit on macOS, /var/lib/sgit on Linux)
+  --lib-dir <dir>       where sgit is installed (default: $LIBDIR)
+  --service-file <path> where the launchd plist or systemd unit is written
+                        (default: $PLIST
+                         or $UNIT)
+  --wrapper <path>      where the as-sgit command goes (default: $WRAPPER)
+  -n, --dry-run         print every command instead of running it
+  -y, --yes             do not ask for confirmation
+  --uninstall           remove the service and the wrapper. Never touches the
+                        account or the store -- it prints how to do that.
+  --print <what>        write one generated file to stdout and exit
+USAGE
+	exit 1
+}
+
+say()  { printf '%s\n' "$*"; }
+step() { printf '\n==> %s\n' "$*"; }
+warn() { printf '%s: warning: %s\n' "$SELF" "$*" >&2; }
+die()  { printf '%s: %s\n' "$SELF" "$*" >&2; exit 1; }
+
+# Every command that changes the machine goes through here, so that --dry-run
+# is complete by construction rather than by remembering to check.
+run() {
+	if [ "$DRY" = yes ]; then
+		printf '   would run:'
+		printf ' %s' "$@"
+		printf '\n'
+		return 0
+	fi
+	"$@"
+}
+
+# The same, for a file this script generates: the content is shown in full on
+# a dry run, because that is the part worth reading before it is installed.
+run_write() {
+	dest="$1" mode="$2" owner="$3"
+	if [ "$DRY" = yes ]; then
+		printf '   would write %s (mode %s, owner %s):\n' "$dest" "$mode" "$owner"
+		sed 's/^/     | /'
+		return 0
+	fi
+	tmp=$(mktemp "${TMPDIR:-/tmp}/sgit-install.XXXXXX") || die 'cannot make a temporary file'
+	cat >"$tmp"
+	sudo install -m "$mode" -o "${owner%:*}" -g "${owner#*:}" "$tmp" "$dest" ||
+		die "cannot write $dest"
+	rm -f "$tmp"
+}
+
+# --- arguments --------------------------------------------------------------
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+	--name) SHADOW_NAME="$2"; IDENTITY_GIVEN=yes; shift 2 ;;
+	--email) SHADOW_EMAIL="$2"; IDENTITY_GIVEN=yes; shift 2 ;;
+	--real-name) REAL_NAME="$2"; REAL_GIVEN=yes; shift 2 ;;
+	--real-email) REAL_EMAIL="$2"; REAL_GIVEN=yes; shift 2 ;;
+	--clone) CLONE_URL="$2"; shift 2 ;;
+	--user) USERNAME="$2"; shift 2 ;;
+	--home) HOMEDIR="$2"; shift 2 ;;
+	--lib-dir) LIBDIR="$2"; shift 2 ;;
+	--service-file) SERVICE_FILE="$2"; shift 2 ;;
+	--wrapper) WRAPPER="$2"; shift 2 ;;
+	-n | --dry-run) DRY=yes; shift ;;
+	-y | --yes) ASSUME_YES=yes; shift ;;
+	--uninstall) ACTION=uninstall; shift ;;
+	--print) ACTION=print; PRINT_WHAT="$2"; shift 2 ;;
+	-h | --help) usage ;;
+	*) die "unknown option: $1" ;;
+	esac
+done
+
+# --- the machine ------------------------------------------------------------
+
+case "$(uname -s)" in
+Darwin)
+	OS=macos
+	OWNER=root:wheel
+	: "${HOMEDIR:=/var/sgit}"
+	LOGIN_SHELL=/bin/sh
+	;;
+Linux)
+	OS=linux
+	OWNER=root:root
+	: "${HOMEDIR:=/var/lib/sgit}"
+	if [ -x /usr/sbin/nologin ]; then LOGIN_SHELL=/usr/sbin/nologin
+	elif [ -x /sbin/nologin ]; then LOGIN_SHELL=/sbin/nologin
+	else LOGIN_SHELL=/bin/false
+	fi
+	;;
+*)
+	die "$(uname -s) is not one this script knows how to set up; the README has the steps by hand"
+	;;
+esac
+
+SGIT="$LIBDIR/bin/sgit"
+if [ -n "$SERVICE_FILE" ]; then
+	PLIST="$SERVICE_FILE"
+	UNIT="$SERVICE_FILE"
+fi
+
+# --- the files it generates -------------------------------------------------
+#
+# Kept as functions that write to stdout so that --print can show any of them
+# without installing anything, and so that a test can check them.
+
+gen_wrapper() {
+	# The first half is expanded (it carries the account and paths chosen
+	# here); the second is not, so that the wrapper's own "$@" survives.
+	cat <<WRAPPER
+#!/bin/sh
+# Installed by sgit's $SELF. The store side of the separate-account
+# deployment, from your side of the boundary.
+#
+# Mostly it just runs sgit as the account that owns the store. -H is the whole
+# point of that: without it HOME stays yours, and sgit would then read your git
+# identity and write the store into your own home -- where the agent this
+# arrangement exists to keep out can read it.
+#
+# Two commands need more than a change of user, because they end with a
+# working tree and the store account cannot make one here: it is unprivileged
+# and your directories are not its to write in. So clone and init are done in
+# two halves -- the store as that account, the working tree as you. See below.
+
+USER_NAME=$USERNAME
+SGIT=$SGIT
+WRAPPER
+	cat <<'WRAPPER'
+SELF=$(basename "$0")
+
+as_store() { sudo -H -u "$USER_NAME" "$SGIT" "$@"; }
+
+die() { printf '%s: %s\n' "$SELF" "$*" >&2; exit 1; }
+
+# The working tree here is on the other side of a user boundary from the
+# store, and the helper transport is a program that reads the store, run as
+# whoever runs git -- that is, as you, who cannot. It fails late and obscurely
+# ("no such shadow repository"), because the helper looks for the store under
+# your own HOME and finds nothing there. Refused early instead.
+refuse_helper() {
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--transport)
+			[ "${2:-}" != helper ] || die \
+				'the helper transport cannot work here: it reads the store, and it would run as you, who cannot. This deployment uses the gateway.'
+			shift 2
+			;;
+		--transport=helper)
+			die 'the helper transport cannot work here: it reads the store, and it would run as you, who cannot. This deployment uses the gateway.'
+			;;
+		*) shift ;;
+		esac
+	done
+}
+
+# store first, as the account that owns it; then the working tree, as you.
+#
+# The second half is the script `sgit gateway url` prints -- the same one the
+# cross-machine setup runs by hand, and the only place that knows what a
+# shadow working tree has to have in it.
+create() {
+	verb="$1"
+	shift
+	refuse_helper "$@"
+
+	# Which positional argument is the directory differs: clone takes
+	# <url> [<dir>], init takes [<dir>]. Options and the values they take
+	# are stepped over; everything is passed on to sgit untouched either
+	# way, this only works out where the tree is going.
+	pos1=''
+	pos2=''
+	npos=0
+	skip=no
+	no_workdir=no
+	for arg in "$@"; do
+		if [ "$skip" = yes ]; then skip=no; continue; fi
+		case "$arg" in
+		--no-workdir) no_workdir=yes; continue ;;
+		--transport | -b) skip=yes; continue ;;
+		-*) continue ;;
+		esac
+		npos=$((npos + 1))
+		case "$npos" in
+		1) pos1="$arg" ;;
+		2) pos2="$arg" ;;
+		esac
+	done
+
+	if [ "$no_workdir" = yes ]; then
+		# Store only: nothing for this side to do.
+		as_store "$verb" "$@"
+		return
+	fi
+
+	case "$verb" in
+	clone)
+		[ -n "$pos1" ] || die 'clone needs a URL'
+		dir="$pos2"
+		if [ -z "$dir" ]; then
+			# What `sgit clone` and `git clone` both do with no second
+			# argument. Done here because the store side is being asked
+			# for --no-workdir and so never works one out.
+			dir=${pos1%/}
+			dir=${dir##*/}
+			dir=${dir%.git}
+		fi
+		;;
+	init)
+		dir="${pos1:-$PWD}"
+		;;
+	esac
+	[ -n "$dir" ] || die "$verb needs somewhere to put the working tree, or --no-workdir"
+	[ ! -e "$dir" ] || die "$dir already exists"
+
+	# The same judgement sgit makes for a working tree it creates itself
+	# (report_created): the directory name is outside the repository and
+	# nothing can hide it, so a name that matches the upstream names the
+	# real repository. Repeated here because the store side, asked for
+	# --no-workdir, has no directory to judge.
+	if [ "$verb" = clone ]; then
+		upname=${pos1%/}
+		upname=${upname##*/}
+		upname=${upname%.git}
+		base=${dir%/}
+		base=${base##*/}
+		if [ "$base" = "$upname" ]; then
+			printf '%s: warning: the directory name matches the upstream repository and is not hidden; rename it if that matters\n' \
+				"$SELF" >&2
+		fi
+	fi
+
+	id=$(as_store "$verb" --no-workdir --print-id "$@") ||
+		die "the store side of $verb failed; nothing was created here"
+	[ -n "$id" ] || die "the store side of $verb did not say which repository it made"
+
+	printf '%s: repository %s; making the working tree in %s\n' "$SELF" "$id" "$dir" >&2
+	if as_store gateway url --bootstrap "$id" | sh -s -- "$dir"; then
+		printf '%s: done. The store is not yours to read, which is the point;\n' "$SELF" >&2
+		printf '%s: %s is an ordinary git repository.\n' "$SELF" "$dir" >&2
+	else
+		die "the store was made ($id) but the working tree was not. The gateway may not be running -- '$SELF gateway status' -- and once it is, '$SELF gateway url $id' prints the script to finish by hand."
+	fi
+}
+
+case "${1:-}" in
+clone | init)
+	verb="$1"
+	shift
+	create "$verb" "$@"
+	;;
+config)
+	# Same reason as refuse_helper, one level up: this would make every
+	# repository made afterwards use a transport that cannot work here.
+	case "$*" in
+	*'sgit.defaultTransport helper'*)
+		die 'the helper transport cannot work here; this deployment uses the gateway'
+		;;
+	esac
+	as_store "$@"
+	;;
+*)
+	exec sudo -H -u "$USER_NAME" "$SGIT" "$@"
+	;;
+esac
+WRAPPER
+}
+
+gen_plist() {
+	cat <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>local.sgit.gateway</string>
+  <key>UserName</key><string>$USERNAME</string>
+  <key>ProgramArguments</key><array>
+    <string>$SGIT</string>
+    <string>gateway</string><string>start</string><string>--foreground</string>
+  </array>
+  <key>EnvironmentVariables</key><dict>
+    <key>HOME</key><string>$HOMEDIR</string>
+    <key>PATH</key><string>/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardErrorPath</key><string>$HOMEDIR/gateway.err</string>
+</dict></plist>
+PLIST
+}
+
+gen_service() {
+	cat <<UNIT
+[Unit]
+Description=sgit gateway
+After=network.target
+
+[Service]
+User=$USERNAME
+Environment=HOME=$HOMEDIR
+ExecStart=$SGIT gateway start --foreground
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+}
+
+if [ "$ACTION" = print ]; then
+	case "$PRINT_WHAT" in
+	plist) gen_plist ;;
+	service) gen_service ;;
+	wrapper) gen_wrapper ;;
+	*) die "--print takes plist, service or wrapper" ;;
+	esac
+	exit 0
+fi
+
+# --- uninstall --------------------------------------------------------------
+
+if [ "$ACTION" = uninstall ]; then
+	STORE="$HOMEDIR/.local/share/sgit"
+
+	# First, while the tools to do it still exist. Removing the wrapper and
+	# then saying "look at what is left" would be advice that cannot be
+	# taken.
+	step 'what is in the store'
+	if ! id "$USERNAME" >/dev/null 2>&1; then
+		say "   there is no $USERNAME account here; nothing is stored"
+	elif [ ! -x "$SGIT" ]; then
+		say "   $SGIT is gone, so the store cannot be listed from here"
+		say "   it would be under $STORE"
+	elif sudo -H -u "$USERNAME" "$SGIT" list 2>/dev/null | sed 's/^/   /'; then
+		# Listed even on a dry run: it reads and changes nothing, and a
+		# dry run of a removal is exactly when what is at stake is worth
+		# seeing.
+		say ''
+		say '   Upstreams are redacted above, as they always are. To see them:'
+		say "     sudo -H -u $USERNAME $SGIT --show-upstream list"
+	else
+		say '   it could not be listed'
+	fi
+
+	step 'removing the service and the wrapper'
+	if [ "$OS" = macos ]; then
+		run sudo launchctl bootout system "$PLIST" || true
+		run sudo rm -f "$PLIST"
+	else
+		run sudo systemctl disable --now sgit-gateway || true
+		run sudo rm -f "$UNIT"
+		run sudo systemctl daemon-reload
+	fi
+	run sudo rm -f "$WRAPPER"
+
+	step 'what is left'
+	cat <<LEFT
+   The account $USERNAME and its home $HOMEDIR are untouched. The store is in
+   $STORE: the rewritten history, the map between
+   the two sides, and the only record of which upstream each repository came
+   from.
+
+   The program is not the store, and removing it costs nothing -- reinstall
+   this script and it is back:
+
+     sudo rm -rf $LIBDIR
+
+   Removing the account and the store CANNOT BE UNDONE. Anything that never
+   reached an upstream goes with it, and no shadow working tree can rebuild
+   it: a working tree holds the rewritten history, not the real one, and
+   nothing on that side knows the upstream address. Look at the list above
+   first.
+LEFT
+	if [ "$OS" = macos ]; then
+		cat <<REMOVE
+
+     sudo sysadminctl -deleteUser $USERNAME
+     sudo rm -rf $HOMEDIR
+
+   -deleteUser removes the home directory unless it is given -keepHome, so the
+   second line is usually nothing left to do; run it to be sure.
+REMOVE
+	else
+		cat <<REMOVE
+
+     sudo userdel -r $USERNAME
+     sudo rm -rf $HOMEDIR
+
+   -r removes the home directory, so the second line is usually nothing left
+   to do; run it to be sure.
+REMOVE
+	fi
+	cat <<KEEP
+
+   To empty the store but keep the account -- and with it the credentials and
+   the git identity it was set up with:
+
+     sudo -H -u $USERNAME rm -rf $STORE
+KEEP
+	exit 0
+fi
+
+# --- what it needs to know --------------------------------------------------
+
+[ "$(id -u)" != 0 ] ||
+	die "run this as yourself, not with sudo: it reads your own git identity, and under sudo that would be root's"
+
+[ -x "$HERE/bin/sgit" ] || die "$HERE does not look like an sgit checkout"
+
+# Run before against a store that already exists? Then this is an update, and
+# an update must not touch the identities. Changing the pseudonym after
+# repositories have been made under it leaves the two sides disagreeing about
+# who they belong to; changing the identity to hide changes who a push
+# restores the work to. Neither is a side effect an update should have, and
+# neither is something to be re-typed from memory at a prompt.
+if [ -x "$SGIT" ] && id "$USERNAME" >/dev/null 2>&1; then
+	INSTALLED=yes
+fi
+
+: "${REAL_NAME:=$(git config --global user.name 2>/dev/null || true)}"
+: "${REAL_EMAIL:=$(git config --global user.email 2>/dev/null || true)}"
+
+ask() {
+	# $1 prompt, $2 variable name. Only ever asked when there is a terminal.
+	printf '%s' "$1" >&2
+	IFS= read -r REPLY_VALUE || die 'nothing to read'
+}
+
+if [ "$INSTALLED" = no ] || [ "$IDENTITY_GIVEN" = yes ]; then
+	if [ -z "$SHADOW_NAME" ] || [ -z "$SHADOW_EMAIL" ]; then
+		if [ -t 0 ] && [ "$DRY" = no ]; then
+			say 'The copy commits under a name that is not yours. Anything will'
+			say 'do, as long as you are content for it to appear in a public'
+			say 'repository.'
+			[ -n "$SHADOW_NAME" ] || { ask 'pseudonym: ' && SHADOW_NAME="$REPLY_VALUE"; }
+			[ -n "$SHADOW_EMAIL" ] || { ask 'its email:  ' && SHADOW_EMAIL="$REPLY_VALUE"; }
+		fi
+		[ -n "$SHADOW_NAME" ] || die 'no pseudonym; pass --name'
+		[ -n "$SHADOW_EMAIL" ] || die 'no pseudonymous address; pass --email'
+	fi
+
+	[ -n "$REAL_NAME" ] ||
+		die 'cannot tell which identity to hide; set git config --global user.name, or pass --real-name'
+	[ -n "$REAL_EMAIL" ] ||
+		die 'cannot tell which address to hide; set git config --global user.email, or pass --real-email'
+
+	case "$SHADOW_EMAIL" in
+	"$REAL_EMAIL") die 'the pseudonymous address is the one being hidden; they must differ' ;;
+	esac
+fi
+
+# --- the plan ---------------------------------------------------------------
+
+if [ "$INSTALLED" = yes ]; then
+	cat <<PLAN
+
+updating sgit in place ($OS)
+
+  account       $USERNAME, already there, with its store and its credentials
+  sgit          $LIBDIR, replaced with this copy
+  gateway       stopped for the swap, then started again on the new code
+  identities    $(if [ "$IDENTITY_GIVEN" = yes ]; then
+		printf 'changing to %s <%s>' "$SHADOW_NAME" "$SHADOW_EMAIL"
+	else printf 'left exactly as they are'; fi)
+
+Nothing in the store is touched: the repositories, the mapping between the two
+sides and the credentials all stay where they are.
+PLAN
+else
+	cat <<PLAN
+
+sgit, with the store out of your own reach ($OS)
+
+  account       $USERNAME, home $HOMEDIR (mode 700)
+  sgit          $LIBDIR, run as $USERNAME through $WRAPPER
+  gateway       git://127.0.0.1:9418, started by $([ "$OS" = macos ] && echo launchd || echo systemd)
+  hiding        $REAL_NAME <$REAL_EMAIL>
+  publishing as $SHADOW_NAME <$SHADOW_EMAIL>
+
+This needs sudo. Nothing of yours is modified: the account, the store and the
+service are all new, and your own git configuration is only read.
+PLAN
+fi
+
+if [ "$DRY" = no ] && [ "$ASSUME_YES" = no ]; then
+	if [ -t 0 ]; then
+		printf '\nGo ahead? [y/N] ' >&2
+		IFS= read -r reply || reply=n
+		case "$reply" in
+		y | Y | yes | YES) ;;
+		*) die 'nothing was changed' ;;
+		esac
+	else
+		die 'not a terminal, and --yes was not given; nothing was changed'
+	fi
+fi
+
+[ "$DRY" = yes ] || sudo -v || die 'sudo is needed'
+
+# --- 1. the account ---------------------------------------------------------
+
+step "the $USERNAME account"
+if id "$USERNAME" >/dev/null 2>&1; then
+	say "   already exists, leaving it alone"
+elif [ "$OS" = macos ]; then
+	run sudo sysadminctl -addUser "$USERNAME" -fullName 'sgit store' \
+		-home "$HOMEDIR" -shell "$LOGIN_SHELL"
+	# Off the login screen and the fast-user-switching menu: it is not a
+	# person and should not look like one.
+	run sudo dscl . create "/Users/$USERNAME" IsHidden 1
+else
+	run sudo useradd --system --create-home --home-dir "$HOMEDIR" \
+		--shell "$LOGIN_SHELL" "$USERNAME"
+fi
+run sudo mkdir -p "$HOMEDIR"
+run sudo chown "$USERNAME" "$HOMEDIR"
+# The store is in here. Nobody else reads it, which is the entire arrangement.
+run sudo chmod 700 "$HOMEDIR"
+
+# --- 2. sgit where that account can run it ----------------------------------
+
+# The access hook runs `$LIBDIR/bin/sgit` once per incoming connection, so
+# replacing that file under a running gateway can hand a connection half a
+# script. Stopped here rather than only restarted at the end.
+if [ "$INSTALLED" = yes ]; then
+	step 'stopping the gateway for the swap'
+	if [ "$OS" = macos ]; then
+		run sudo launchctl bootout system "$PLIST" 2>/dev/null || true
+	else
+		run sudo systemctl stop sgit-gateway 2>/dev/null || true
+	fi
+fi
+
+step "sgit in $LIBDIR"
+run sudo mkdir -p "$LIBDIR/bin" "$LIBDIR/lib"
+# The contents, not the directories: `cp -R bin dst/` puts them in dst/bin/bin
+# the second time round, and this script has to survive being run twice.
+run sudo cp -R "$HERE/bin/." "$LIBDIR/bin/"
+run sudo cp -R "$HERE/lib/." "$LIBDIR/lib/"
+# Files this copy no longer has. Named one by one rather than clearing the
+# directory: nothing here removes a path it has not first found in the source.
+for d in bin lib; do
+	[ -d "$LIBDIR/$d" ] || continue
+	for f in "$LIBDIR/$d"/*; do
+		[ -e "$f" ] || continue
+		[ ! -e "$HERE/$d/${f##*/}" ] || continue
+		say "   removing ${f##*/}, which this version does not have"
+		run sudo rm -f "$f"
+	done
+done
+run sudo chown -R "${OWNER%:*}:${OWNER#*:}" "$LIBDIR"
+# Readable and runnable by the service account, writable by root alone: it
+# runs as another user, so anyone who could edit it could act as that user.
+run sudo chmod -R go-w "$LIBDIR"
+
+# --- 3. the wrapper ---------------------------------------------------------
+
+step "$WRAPPER"
+gen_wrapper | run_write "$WRAPPER" 755 "$OWNER"
+
+# --- 4. configuration, as that account --------------------------------------
+
+step "configuring $USERNAME"
+# -H every time. Without it HOME stays yours and every one of these lands in
+# your own home instead.
+if [ "$INSTALLED" = no ] || [ "$REAL_GIVEN" = yes ]; then
+	run sudo -H -u "$USERNAME" git config --global user.name "$REAL_NAME"
+	run sudo -H -u "$USERNAME" git config --global user.email "$REAL_EMAIL"
+else
+	say '   the identity to hide is left as it was set up'
+fi
+if [ "$INSTALLED" = no ] || [ "$IDENTITY_GIVEN" = yes ]; then
+	if [ "$INSTALLED" = yes ]; then
+		warn "changing the pseudonym to $SHADOW_NAME <$SHADOW_EMAIL>"
+		say '   Repositories already made keep the one they were made with, so'
+		say '   the two will not agree afterwards. sgit doctor will say so.'
+	fi
+	run sudo -H -u "$USERNAME" "$SGIT" config --init \
+		--name "$SHADOW_NAME" --email "$SHADOW_EMAIL"
+else
+	say '   the pseudonym is left as it was set up'
+fi
+run sudo -H -u "$USERNAME" "$SGIT" config sgit.defaultTransport gateway
+
+# --- 5. the gateway as a service --------------------------------------------
+
+step 'the gateway'
+if [ "$OS" = macos ]; then
+	gen_plist | run_write "$PLIST" 644 root:wheel
+	# bootout first so that a second run reloads rather than fails.
+	run sudo launchctl bootout system "$PLIST" 2>/dev/null || true
+	run sudo launchctl bootstrap system "$PLIST"
+else
+	gen_service | run_write "$UNIT" 644 root:root
+	run sudo systemctl daemon-reload
+	run sudo systemctl enable --now sgit-gateway
+fi
+
+# An installer that does not look is only a list of commands. This is also the
+# first thing that runs sgit as the service account, so it catches a bad HOME,
+# a missing dependency or an unrunnable copy, not just a service that failed.
+if [ "$DRY" = no ]; then
+	sleep 1
+	if sudo -H -u "$USERNAME" "$SGIT" gateway status 2>/dev/null |
+		grep -q '^state.*running'; then
+		say '   running on 127.0.0.1:9418'
+	else
+		warn 'the gateway did not come up'
+		if [ "$OS" = macos ]; then
+			say "   its own diagnostics are in $HOMEDIR/gateway.err"
+		else
+			say '   its own diagnostics: journalctl -u sgit-gateway'
+		fi
+		say "   and: $WRAPPER gateway status"
+	fi
+fi
+
+# --- 6. what is left, which is the part that needs you ----------------------
+
+step 'credentials'
+cat <<CREDS
+   Pushes run from a hook with no terminal, so the credentials must work with
+   nobody there to type anything. Give the account its own key rather than
+   copying yours: this one can have no passphrase, and yours should keep one.
+
+     sudo -H -u $USERNAME sh -c 'mkdir -p ~/.ssh && chmod 700 ~/.ssh'
+     sudo -H -u $USERNAME sh -c 'ssh-keygen -q -t ed25519 -N "" -C "sgit store" -f ~/.ssh/id_ed25519'
+     sudo -H -u $USERNAME sh -c 'cat ~/.ssh/id_ed25519.pub'
+
+   Add that to the forge, then accept the host key once by hand -- an
+   unattended push has no terminal to be asked at:
+
+     sudo -H -u $USERNAME ssh -T git@github.com
+
+   The quoting is not decoration: ~ is expanded by your shell before sudo
+   runs, so an unquoted ~/.ssh names your home rather than $USERNAME's.
+
+   An HTTPS token instead: put it in $HOMEDIR/.git-credentials (mode 600) and
+     $(basename "$WRAPPER") git config --global credential.helper store
+
+   Not the macOS login keychain either way: it is locked whenever that account
+   is not logged in, which is always.
+
+   Signing lives here too, for the same reason: the commit that gets signed is
+   the one rebuilt on the way up, under your real identity. Same constraint --
+   no terminal, so no passphrase -- which is why ssh signing suits it:
+
+     sudo -H -u $USERNAME sh -c 'ssh-keygen -q -t ed25519 -N "" -C "sgit signing" -f ~/.ssh/signing'
+     $(basename "$WRAPPER") git config --global gpg.format ssh
+     $(basename "$WRAPPER") git config --global user.signingkey $HOMEDIR/.ssh/signing.pub
+     $(basename "$WRAPPER") git config --global commit.gpgsign true
+
+   The copy you work in never signs: a signature carries a key fingerprint.
+CREDS
+
+if [ -n "$CLONE_URL" ]; then
+	step 'the first clone'
+	say '   Done here, and interactively, so that anything the credentials want'
+	say '   to ask -- a passphrase, an unknown host key -- asks while you can'
+	say '   answer it.'
+	# Through the wrapper, not through sgit: the working tree half has to
+	# happen as you, and that is what the wrapper is for.
+	run "$WRAPPER" clone "$CLONE_URL"
+fi
+
+step 'done'
+cat <<NEXT
+   $(basename "$WRAPPER") is how you reach the store from here:
+
+     $(basename "$WRAPPER") list                 which repositories, and their ids
+     $(basename "$WRAPPER") sync                 fetch upstream and rewrite what is new
+     $(basename "$WRAPPER") doctor               check it over
+     $(basename "$WRAPPER") git log              look at the real repository
+
+   And to start on a repository -- one command, both halves: the store as
+   $USERNAME, the working tree here as you.
+
+     $(basename "$WRAPPER") clone <url> [<dir>]
+     $(basename "$WRAPPER") init [<dir>]
+
+   The store is not yours to read, which is the point; the working tree is an
+   ordinary git repository, and needs no sgit to use.
+NEXT

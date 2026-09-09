@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+#
+# git remote helper for sgit:: URLs.
+#
+# Invoked by git as `git-remote-sgit <remote> <address>` where the address is
+# the repository id from a `sgit::<id>` URL. Only the `connect` capability is
+# implemented: after acknowledging, the native git service takes over this same
+# stdio pair, so the helper never has to speak the pack protocol itself.
+#
+# stdout is the protocol stream (spec 6.6). Nothing but protocol bytes may
+# reach it, and no child process may inherit stdin -- a credential prompt
+# reading from it would eat the protocol.
+
+set -eu
+
+_sgit_root() {
+	local src="${BASH_SOURCE[0]}" dir
+	while [ -L "$src" ]; do
+		dir=$(cd -P "$(dirname "$src")" && pwd)
+		src=$(readlink "$src")
+		case "$src" in
+		/*) ;;
+		*) src="$dir/$src" ;;
+		esac
+	done
+	cd -P "$(dirname "$src")/.." && pwd
+}
+
+SGIT_ROOT=$(_sgit_root)
+for _m in common config ident rewrite scrub store gateway sync; do
+	# shellcheck source=/dev/null
+	. "$SGIT_ROOT/lib/$_m.sh"
+done
+unset _m
+
+SGIT_HOME="${SGIT_HOME:-$HOME/.local/share/sgit}"
+SGIT_GLOBAL_CONFIG="${SGIT_GLOBAL_CONFIG:-$SGIT_HOME/config}"
+
+sgit_clear_git_env
+
+[ $# -ge 2 ] || sgit_die "usage: git-remote-sgit <remote> <id>"
+address="$2"
+address="${address#sgit::}"
+store_require "$address"
+sgit_config_load
+
+# Refresh the shadow repository before the service starts.
+#
+# For a fetch this must succeed: if the upstream is unreachable, the fetch has
+# to fail exactly as a direct one would. For a push it is best effort, because
+# the real error will surface in pre-receive with a far more useful message.
+refresh() {
+	local required="$1"
+	if [ "$required" = required ]; then
+		{ sync_down; } >&2 </dev/null
+	else
+		{ sync_down; } >&2 </dev/null || sgit_warn "could not refresh before the push; continuing"
+	fi
+}
+
+serve() {
+	local service="$1" required="$2"
+	refresh "$required"
+	# The empty line acknowledges the connection; everything after it on this
+	# stream belongs to the service.
+	printf '\n'
+	exec git "${service#git-}" "$SGIT_SHADOW"
+}
+
+while IFS= read -r line; do
+	case "$line" in
+	capabilities)
+		printf 'connect\n\n'
+		;;
+	'connect git-upload-pack')
+		serve git-upload-pack required
+		;;
+	'connect git-receive-pack')
+		serve git-receive-pack optional
+		;;
+	'')
+		# A blank line ends a batch of commands; git closes stdin when done.
+		;;
+	*)
+		sgit_die "unsupported remote helper command: $line"
+		;;
+	esac
+done
