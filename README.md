@@ -236,14 +236,24 @@ processes of its own, dozens of them within a second, each replacing the index
 the ordinary way: write `.git/index.lock`, rename it over `.git/index`. Git's
 own locking holds. The guest's view of the directory does not. Afterwards
 `stat` and `ls` in the guest still report a healthy index while every `open()`
-on it returns ENOENT, through any spelling of the path, and it does not recover
-on its own. Git, finding no index it can open, carries on with an empty one.
+on it returns ENOENT, through any spelling of the path. Git, finding no index
+it can open, carries on with an empty one.
 
 What that looks like is a wholesale deletion: `git status` shows every tracked
 file staged for deletion and `git ls-files` prints nothing. Nothing is actually
-gone, and `git reset` rebuilds the index from HEAD — but the state arrives
-silently, and **a commit made in it commits the deletions.** Undo that with
-`git reset --soft HEAD^`, then `git reset`.
+gone — but the state arrives silently, and **a commit made in it commits the
+deletions.** Undo that with `git reset --soft HEAD^`.
+
+Try a new process first. The stale view belongs to the process that holds it,
+so a shell whose working directory was replaced keeps it for as long as that
+shell lives: opening a new terminal restores the tree with nothing else done,
+and a long-running process that reads the tree — a daemon, a watcher, an
+editor — keeps serving the broken view until it is restarted. If a fresh
+process still sees an empty index, `git reset` rebuilds it from HEAD.
+
+It is not only `.git/index`. Git writes refs the same way it writes the index,
+so `refs/heads/<branch>` can go the same way, and then `git log` reports that
+the branch has no commits yet.
 
 Observed on a macOS host and a macOS guest under Apple Virtualization, over a
 virtio-fs share. With an editor open on the host, a loop of `git reset` in the
@@ -965,6 +975,19 @@ whether signing is off, whether the guard hook is in place. It deliberately
 carries no list of your real identities — it tells you what is there, and you
 decide whether any of it is yours. That is what makes it safe to leave lying
 around in the shadow repository.
+
+`sgit doctor` runs the hooks rather than checking that they are there. Every
+hook sgit installs is a shim holding an absolute path to `bin/sgit`, fixed when
+the gateway starts or when the repository is created and never revised
+afterwards, so renaming or moving the sgit tree breaks all of them at once —
+and neither failure says so. git-daemon replaces whatever an access hook prints
+with `access denied or repository not exported`, which reads as a problem with
+the store, and a `pre-receive` that cannot start rejects a push while naming a
+path nobody recognises. Doctor also reads the `--base-path` of the running
+daemon out of the process, since that is fixed at startup too and a store that
+has moved since leaves the daemon refusing everything with that same message.
+`sgit gateway restart` rewrites the access hook; doctor prints the `pre-receive`
+shim to put back.
 
 Both also report the filesystem they are looking at, and warn when it is a
 shared or network one — `AppleVirtIOFS`, `virtiofs`, `nfs`, `smbfs`, `cifs`,

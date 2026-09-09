@@ -191,6 +191,23 @@ gateway_write_state() {
 	printf 'listen=%s\nport=%s\n' "$1" "$2" >"$SGIT_HOME/gateway.state"
 }
 
+# What the running daemon was actually started with, read from the process
+# rather than from anything sgit wrote down. --base-path cannot be changed
+# after the daemon is up, and it is the one setting that never appears in the
+# status output: a daemon serving a base path that no longer holds the
+# repositories refuses every request with git's generic "access denied or
+# repository not exported", which reads as a problem with the store.
+#
+# A base path containing a space would be cut short here. Reporting a wrong
+# path is no worse than reporting none, and the comparison that uses this
+# fails safe: it only speaks up when the two differ.
+gateway_running_base_path() {
+	local pid
+	pid=$(gateway_running_pid) || return 1
+	ps -o command= -p "$pid" 2>/dev/null |
+		sed -n 's/.*--base-path=\([^ ]*\).*/\1/p' | sed -n 1p
+}
+
 # -> GATEWAY_RUN_LISTEN, GATEWAY_RUN_PORT
 gateway_running_params() {
 	GATEWAY_RUN_LISTEN=''
@@ -402,7 +419,7 @@ gateway_stop() {
 }
 
 gateway_status() {
-	local pid id n=0 allow port listen advertise raw
+	local pid id n=0 allow port listen advertise raw base
 
 	port=$(_config_one gateway.port)
 	port="${port:-9418}"
@@ -443,6 +460,12 @@ IDS
 	# Kept out of the field list above so that it reads as the exception it
 	# is, rather than as another property of the gateway.
 	if gateway_running_pid >/dev/null; then
+		base=$(gateway_running_base_path) || base=''
+		if [ -n "$base" ] && [ "$base" != "$SGIT_HOME/repos" ]; then
+			printf '\nit is serving %s, and this store is %s\n' "$base" "$SGIT_HOME/repos"
+			printf 'so every request is refused as "not exported"\n'
+			printf 'restart it to serve this store:  sgit gateway restart\n'
+		fi
 		if gateway_running_params; then
 			if [ "$GATEWAY_RUN_LISTEN:$GATEWAY_RUN_PORT" != "$listen:$port" ]; then
 				printf '\nit is running on %s:%s and the configuration now says %s:%s\n' \

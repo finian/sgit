@@ -301,4 +301,98 @@ case "$out" in
 *) pass 'and does not guess' ;;
 esac
 
+# --- hooks that cannot start ------------------------------------------------
+#
+# Every hook sgit installs is a shim holding an absolute path to bin/sgit,
+# written once and never revised, so renaming the sgit tree breaks all of them.
+# Neither failure announces itself: git-daemon replaces an access hook's own
+# message with "access denied or repository not exported", and doctor used to
+# call a pre-receive hook installed on the strength of it being executable.
+
+SH="$SGIT_HOME/repos/$id/shadow.git"
+cp "$SH/hooks/pre-receive" "$TRASH/pre-receive.good"
+
+out=$(sgit doctor 2>&1)
+case "$out" in
+*'the pre-receive hook is installed and starts'*)
+	pass 'a working pre-receive hook is reported as starting' ;;
+*) fail 'a working pre-receive hook is reported as starting' "$out" ;;
+esac
+
+printf '#!/bin/sh\nexec "/nowhere/bin/sgit" --id "%s" pre-receive\n' "$id" >"$SH/hooks/pre-receive"
+chmod +x "$SH/hooks/pre-receive"
+out=$(sgit doctor 2>&1)
+case "$out" in
+*'the pre-receive hook execs /nowhere/bin/sgit, which does not run'*)
+	pass 'a pre-receive hook pointing nowhere is caught' ;;
+*) fail 'a pre-receive hook pointing nowhere is caught' "$out" ;;
+esac
+# Being executable is exactly what the old check tested, so say it plainly.
+ok 'and the hook file itself is executable, which is what made this invisible' \
+	test -x "$SH/hooks/pre-receive"
+case "$out" in
+*'exec "'*'/bin/sgit" --id "'"$id"'" pre-receive'*)
+	pass 'and the repair is printed ready to paste' ;;
+*) fail 'and the repair is printed ready to paste' "$out" ;;
+esac
+cp "$TRASH/pre-receive.good" "$SH/hooks/pre-receive"
+
+# The access hook is run rather than inspected: handed a path outside the
+# store, a healthy one declines at its first branch, reaching no store, no lock
+# and no network.
+printf '#!/bin/sh\nexec "%s/bin/sgit" gateway-access "$@"\n' "$SGIT_SRC_ROOT" >"$SGIT_HOME/access-hook"
+chmod +x "$SGIT_HOME/access-hook"
+out=$(sgit doctor 2>&1)
+case "$out" in
+*'the access hook runs and declines a path outside the store'*)
+	pass 'a working access hook is run, not just stat-ed' ;;
+*) fail 'a working access hook is run, not just stat-ed' "$out" ;;
+esac
+
+printf '#!/bin/sh\nexec "/nowhere/bin/sgit" gateway-access "$@"\n' >"$SGIT_HOME/access-hook"
+chmod +x "$SGIT_HOME/access-hook"
+out=$(sgit doctor 2>&1)
+case "$out" in
+*'the access hook does not run'*) pass 'an access hook pointing nowhere is caught' ;;
+*) fail 'an access hook pointing nowhere is caught' "$out" ;;
+esac
+case "$out" in
+*'No such file or directory'*)
+	pass "and what the shell said is passed on, since git-daemon discards it" ;;
+*) fail "and what the shell said is passed on, since git-daemon discards it" "$out" ;;
+esac
+rm -f "$SGIT_HOME/access-hook"
+
+# --- a daemon serving a store that has moved --------------------------------
+#
+# --base-path is fixed when the daemon starts and never appears in the status
+# output, so a store that moved since leaves a daemon refusing everything with
+# the same message a missing repository gives. Faked through ps, since the test
+# has no daemon of its own.
+
+printf '%s\n' "$$" >"$SGIT_HOME/gateway.pid"
+cat >"$TRASH/fakebin/ps" <<'EOF'
+#!/bin/sh
+echo "/usr/libexec/git-core/git-daemon --base-path=/somewhere/else/repos --access-hook=/x --listen=127.0.0.1 --port=9418"
+EOF
+chmod +x "$TRASH/fakebin/ps"
+out=$(PATH="$TRASH/fakebin:$PATH" sgit doctor 2>&1)
+case "$out" in
+*'it is serving /somewhere/else/repos'*)
+	pass 'a daemon serving another base path is caught' ;;
+*) fail 'a daemon serving another base path is caught' "$out" ;;
+esac
+
+cat >"$TRASH/fakebin/ps" <<EOF
+#!/bin/sh
+echo "/usr/libexec/git-core/git-daemon --base-path=$SGIT_HOME/repos --access-hook=/x --listen=127.0.0.1 --port=9418"
+EOF
+chmod +x "$TRASH/fakebin/ps"
+out=$(PATH="$TRASH/fakebin:$PATH" sgit doctor 2>&1)
+case "$out" in
+*'it is serving this store'*) pass 'and the matching case is reported as serving this store' ;;
+*) fail 'and the matching case is reported as serving this store' "$out" ;;
+esac
+rm -f "$TRASH/fakebin/ps" "$SGIT_HOME/gateway.pid"
+
 test_summary

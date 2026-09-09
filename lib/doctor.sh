@@ -94,6 +94,29 @@ _doctor_is_shared_fs() {
 	return 1
 }
 
+# Every hook sgit installs is a two-line shim that execs sgit by absolute path,
+# written once -- when the gateway started, or when the repository was created
+# -- and never revised. Moving or renaming the sgit tree breaks all of them at
+# once, and the breakage is close to invisible: git-daemon replaces whatever an
+# access hook prints with "access denied or repository not exported", which
+# reads as a problem with the store, and a pre-receive that cannot start
+# rejects a push while naming a path nobody recognises.
+#
+# So checking that the hook file is executable proves nothing. What it execs
+# has to be there too, which is what these two read and test.
+_doctor_hook_target() {
+	sed -n 's/^exec "\([^"]*\)".*/\1/p' "$1" 2>/dev/null | sed -n 1p
+}
+
+# Run it rather than stat it. Resolving its own root and sourcing the library
+# is most of what sgit does before a hook can report anything, and --version
+# exercises exactly that: it is answered after the library is loaded and before
+# any command touches a repository, the network, or the store lock.
+_doctor_hook_starts() {
+	[ -n "$1" ] || return 1
+	"$1" --version >/dev/null 2>&1
+}
+
 doctor_store_placement() {
 	local fstype mode
 
@@ -173,7 +196,7 @@ doctor_identity() {
 }
 
 doctor_repo() {
-	local id="$1" v hidden n missing counted transport expected actual wdfs
+	local id="$1" v hidden n missing counted transport expected actual wdfs target
 	store_use "$id"
 	transport=$(repo_config_get sgit.transport)
 
@@ -207,7 +230,16 @@ doctor_repo() {
 	esac
 
 	if [ -x "$SGIT_SHADOW/hooks/pre-receive" ]; then
-		d_ok 'the pre-receive hook is installed'
+		target=$(_doctor_hook_target "$SGIT_SHADOW/hooks/pre-receive")
+		if _doctor_hook_starts "$target"; then
+			d_ok 'the pre-receive hook is installed and starts'
+		else
+			d_warn "the pre-receive hook execs ${target:-a path it does not state}, which does not run; every push to this repository would be rejected"
+			d_note 'the path is fixed when the repository is created, so it breaks when the sgit tree moves or is renamed'
+			d_note "repair it by writing this into $SGIT_SHADOW/hooks/pre-receive, and chmod +x:"
+			d_note '  #!/bin/sh'
+			d_note "  exec \"$SGIT_ROOT/bin/sgit\" --id \"$id\" pre-receive"
+		fi
 	else
 		d_warn 'the pre-receive hook is missing; pushes would bypass the upward path'
 	fi
@@ -295,17 +327,68 @@ doctor_repo() {
 	fi
 }
 
+# The access hook, exercised end to end rather than inspected.
+#
+# git-daemon hands the hook a repository path and refuses the connection on a
+# non-zero exit. Giving it a path outside the store makes the hook take its
+# very first branch and decline -- which is a complete run of the shim, of
+# sgit's own startup and of the hook itself, and reaches no store, no lock and
+# no network. A healthy hook therefore fails here, in one specific way, and
+# anything else means it could not get that far.
+doctor_gateway_hook() {
+	local hook target out rc
+	hook=$(gateway_hook_path)
+
+	if [ ! -f "$hook" ]; then
+		d_note 'no access hook is installed; it is written when the gateway starts'
+		return 0
+	fi
+	if [ ! -x "$hook" ]; then
+		d_warn "the access hook $hook is not executable; the gateway would refuse every request"
+		d_note 'sgit gateway restart rewrites it'
+		return 0
+	fi
+
+	target=$(_doctor_hook_target "$hook")
+	out=$("$hook" upload-pack /sgit-doctor-probe probe probe 127.0.0.1 9418 2>&1) && rc=0 || rc=$?
+	case "$rc:$out" in
+	1:*'not a shadow repository'*)
+		d_ok 'the access hook runs and declines a path outside the store'
+		;;
+	*)
+		d_warn "the access hook does not run; the gateway would refuse every request as \"not exported\""
+		d_note "it execs ${target:-a path it does not state}"
+		[ -z "$out" ] || d_note "it said: $(printf '%s' "$out" | sed -n 1p)"
+		d_note 'the path is fixed when the gateway starts, so it breaks when the sgit tree moves or is renamed'
+		d_note 'sgit gateway restart rewrites it'
+		;;
+	esac
+	return 0
+}
+
 doctor_gateway() {
-	local listen allow port want
+	local listen allow port want base
 	d_head 'gateway (spec 7.2.1)'
 	if [ "$(_config_one gateway.allowPush)" = false ]; then
 		d_note 'pushing through the gateway is disabled (gateway.allowPush)'
 	fi
 	if gateway_running_pid >/dev/null; then
 		d_ok "running (pid $(gateway_running_pid))"
+		# Fixed when the daemon started and unchangeable while it runs, so
+		# a store that has moved since leaves a daemon serving nothing.
+		base=$(gateway_running_base_path) || base=''
+		if [ -z "$base" ]; then
+			d_note 'what it is serving could not be read from the process'
+		elif [ "$base" = "$SGIT_HOME/repos" ]; then
+			d_ok "it is serving this store ($base)"
+		else
+			d_warn "it is serving $base, but this store is $SGIT_HOME/repos; every request would be refused as \"not exported\""
+			d_note 'sgit gateway restart'
+		fi
 	else
 		d_note 'not running'
 	fi
+	doctor_gateway_hook
 	listen=$(_gateway_listen_or_empty) || listen=''
 	if [ -n "$listen" ]; then
 		d_note "bind address: $listen"
