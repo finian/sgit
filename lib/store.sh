@@ -129,11 +129,31 @@ store_init_shadow() {
 # The upward path runs inside the shadow repository's pre-receive hook, so that
 # the shadow ref only moves once the real side has accepted the change. The
 # hook is a thin shim; the logic lives in `sgit pre-receive`.
+#
+# git relays whatever this hook writes back to whoever pushed -- the shadow
+# side, which must not learn where the store is (spec 6.4). Two things would
+# otherwise name it, both before sgit can say anything about itself: a shell
+# reports a failed exec by printing the path it tried, so the shim tests the
+# path and speaks for itself instead; and a library that will not load makes
+# the shell print that file's path, which SGIT_HOOK_BOUNDARY turns into the
+# same anonymous refusal. Neither detail is lost, it only stays on the store
+# side -- `sgit doctor` runs the hooks from there and reports what happened.
+#
+# The gateway's access hook needs none of this: git-daemon discards whatever a
+# hook prints and substitutes a message of its own, so nothing it says can
+# reach a client.
 store_install_hooks() {
 	local hook="$SGIT_SHADOW/hooks/pre-receive"
 	mkdir -p "$SGIT_SHADOW/hooks"
 	cat >"$hook" <<HOOK
 #!/bin/sh
+[ -x "$SGIT_ROOT/bin/sgit" ] || {
+	echo 'sgit: the hook on the store side could not start' >&2
+	echo 'sgit: run "sgit doctor" where the store is' >&2
+	exit 1
+}
+SGIT_HOOK_BOUNDARY=1
+export SGIT_HOOK_BOUNDARY
 exec "$SGIT_ROOT/bin/sgit" --id "$SGIT_ID" pre-receive
 HOOK
 	chmod +x "$hook"

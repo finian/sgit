@@ -35,7 +35,10 @@ copy never contained it.
 **Hidden**: author, committer and tagger identities; the identity trailers in
 commit messages (`Signed-off-by`, `Co-authored-by`, …); GPG signatures, which
 carry a key fingerprint; the upstream URL, host, owner and repository name,
-including inside error messages the upstream sends back.
+including inside error messages the upstream sends back; and where the store
+is, including inside the refusals a failed push carries back from it — a path
+under the store names the account and the directory layout of the machine
+holding it.
 
 **Not hidden — and this is a boundary, not a to-do item**: anything written
 *into the files themselves*. `AUTHORS`, `.mailmap`, `CODEOWNERS`, the `author`

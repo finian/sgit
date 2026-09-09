@@ -196,8 +196,15 @@ sgit_identity_resolve() {
 		printf 'Set them as you normally would:\n' >&2
 		printf '    git config --global user.name  "Your Name"\n' >&2
 		printf '    git config --global user.email you@example.com\n\n' >&2
-		printf 'or for this repository alone:\n' >&2
-		printf '    git -C %s config user.email you@example.com\n' "$real" >&2
+		# The mirror's path is the useful half of this advice on the store
+		# side, and a leak across the pre-receive boundary (spec 6.4).
+		if [ -n "${SGIT_HOOK_BOUNDARY:-}" ]; then
+			printf 'or for that repository alone, where the store is:\n' >&2
+			printf '    git -C <the real mirror> config user.email you@example.com\n' >&2
+		else
+			printf 'or for this repository alone:\n' >&2
+			printf '    git -C %s config user.email you@example.com\n' "$real" >&2
+		fi
 		exit 1
 	fi
 

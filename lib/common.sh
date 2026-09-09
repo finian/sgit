@@ -47,9 +47,28 @@ sgit_restore_locale() {
 NL='
 '
 
-sgit_note() { printf 'sgit: %s\n' "$*" >&2; }
-sgit_warn() { printf 'sgit: warning: %s\n' "$*" >&2; }
-sgit_die() { printf 'sgit: fatal: %s\n' "$*" >&2; exit 1; }
+# What sgit says about itself, with the store kept out of it when the listener
+# is not entitled to hear it.
+#
+# Run as the shadow repository's pre-receive hook, everything these three write
+# is relayed by git to whoever pushed -- the shadow side, which must not learn
+# where the store is (spec 6.4). Messages are otherwise written for the store
+# side, where naming the mirror that failed is the most useful thing they can
+# do, so the substitution happens here, once, rather than by asking every
+# message to be careful about where it might be read. Away from that boundary
+# it is a no-op, and `sgit doctor` therefore still reports paths in full.
+sgit_hide_paths() {
+	local s="$*"
+	[ -n "${SGIT_HOOK_BOUNDARY:-}" ] || { printf '%s' "$s"; return 0; }
+	# An empty prefix would match everywhere, so neither is assumed set.
+	[ -z "${SGIT_HOME:-}" ] || s="${s//"$SGIT_HOME"/<the store>}"
+	[ -z "${SGIT_ROOT:-}" ] || s="${s//"$SGIT_ROOT"/<the sgit installation>}"
+	printf '%s' "$s"
+}
+
+sgit_note() { printf 'sgit: %s\n' "$(sgit_hide_paths "$*")" >&2; }
+sgit_warn() { printf 'sgit: warning: %s\n' "$(sgit_hide_paths "$*")" >&2; }
+sgit_die() { printf 'sgit: fatal: %s\n' "$(sgit_hide_paths "$*")" >&2; exit 1; }
 
 # Drop the per-repository environment git exports to helpers and hooks.
 #

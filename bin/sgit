@@ -26,9 +26,24 @@ SGIT_CALLER_LC_CTYPE="${LC_CTYPE-}"
 SGIT_CALLER_LANG="${LANG-}"
 
 SGIT_ROOT=$(_sgit_root)
+# A library that will not load makes the shell name the file it failed on, and
+# on the pre-receive path git relays that to whoever pushed. Where the store
+# lives is exactly what the shadow side must not learn (spec 6.4), so the hook
+# that crosses that boundary sets SGIT_HOOK_BOUNDARY and the diagnosis is
+# replaced with a refusal that names nothing. Run from the store side, where
+# there is no one to hide from, the error is printed as it comes -- which is
+# how `sgit doctor` reports it.
 for _m in common config ident rewrite scrub store gateway sync push remote workdir doctor; do
 	# shellcheck source=/dev/null
-	. "$SGIT_ROOT/lib/$_m.sh"
+	if [ -n "${SGIT_HOOK_BOUNDARY:-}" ]; then
+		. "$SGIT_ROOT/lib/$_m.sh" 2>/dev/null || {
+			echo 'sgit: the hook on the store side could not start' >&2
+			echo 'sgit: run "sgit doctor" where the store is' >&2
+			exit 1
+		}
+	else
+		. "$SGIT_ROOT/lib/$_m.sh"
+	fi
 done
 unset _m
 
