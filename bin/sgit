@@ -211,7 +211,9 @@ cmd_clone() {
 	fi
 	[ -z "$head" ] || git -C "$SGIT_REAL" symbolic-ref HEAD "$head"
 
-	store_write_config "$transport" "$([ "$no_workdir" = yes ] || printf '%s' "$(cd "$(dirname "$dir")" && pwd)/$(basename "$dir")")"
+	SGIT_ABSPATH=''
+	[ "$no_workdir" = yes ] || sgit_abspath "$dir"
+	store_write_config "$transport" "$SGIT_ABSPATH"
 	repo_config upstream.fetchRemote origin
 	repo_config upstream.pushRemote origin
 	store_init_shadow "$transport"
@@ -268,7 +270,9 @@ cmd_init() {
 	git init -q --bare "$SGIT_REAL"
 	git -C "$SGIT_REAL" symbolic-ref HEAD "refs/heads/$branch"
 
-	store_write_config "$transport" "$([ "$no_workdir" = yes ] || printf '%s' "$dir")"
+	SGIT_ABSPATH=''
+	[ "$no_workdir" = yes ] || sgit_abspath "$dir"
+	store_write_config "$transport" "$SGIT_ABSPATH"
 	store_init_shadow "$transport"
 	sync_down
 
@@ -309,6 +313,7 @@ cmd_list() {
 		case "$STORE_WD_STATE" in
 		ok) wd="$STORE_WD" ;;
 		missing) wd="$STORE_WD  (gone -- sgit restore $id)" ;;
+		relative) wd="$STORE_WD  (recorded as a relative path -- sgit --id $id config --repo sgit.workdir <absolute path>)" ;;
 		foreign) wd="$STORE_WD  (not a shadow working tree any more)" ;;
 		none) wd='-  (none created here)' ;;
 		esac
@@ -636,7 +641,8 @@ cmd_restore() {
 	workdir_populate "$dir"
 	workdir_finish "$dir"
 	sgit_cleanup_drop "$dir"
-	repo_config sgit.workdir "$(cd "$(dirname "$dir")" && pwd)/$(basename "$dir")"
+	sgit_abspath "$dir"
+	repo_config sgit.workdir "$SGIT_ABSPATH"
 
 	printf 'restored the working tree of %s at %s\n' "$id" "$dir" >&2
 	workdir_remote_url

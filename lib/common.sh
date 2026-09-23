@@ -224,6 +224,34 @@ CLEANUP
 	SGIT_CLEANUP_PATHS="$kept"
 }
 
+# An absolute spelling of a path, whether or not it exists yet.
+#
+# Paths recorded in a store's config are read later from wherever sgit happens
+# to be run, so a relative one silently means something else from every other
+# directory. This works on the string alone: a working tree is recorded before
+# it is created, when there may be no directory yet to cd into.
+#   sgit_abspath <path>  ->  SGIT_ABSPATH
+sgit_abspath() {
+	local p="$1" part out=''
+	case "$p" in
+	/*) ;;
+	*) p="$PWD/$p" ;;
+	esac
+	while [ -n "$p" ]; do
+		part="${p%%/*}"
+		case "$p" in
+		*/*) p="${p#*/}" ;;
+		*) p='' ;;
+		esac
+		case "$part" in
+		'' | .) ;;
+		..) out="${out%/*}" ;;
+		*) out="$out/$part" ;;
+		esac
+	done
+	SGIT_ABSPATH="${out:-/}"
+}
+
 # Ensure $SGIT_TMPDIR exists; it is removed when the process exits.
 #
 # This sets a global rather than printing the path, because a command

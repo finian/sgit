@@ -564,6 +564,12 @@ gateway_fix_workdir_urls() {
 				skipped "$id" "$STORE_WD" "$id"
 			continue
 			;;
+		relative)
+			n_skip=$((n_skip + 1))
+			printf '%-7s  %s: the working tree is recorded as the relative path %s -- record it absolutely with: sgit --id %s config --repo sgit.workdir <path>\n' \
+				skipped "$id" "$STORE_WD" "$id"
+			continue
+			;;
 		foreign)
 			n_skip=$((n_skip + 1))
 			printf '%-7s  %s: %s is no longer this working tree\n' \

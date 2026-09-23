@@ -57,4 +57,38 @@ esac
 ok 'and it names a repository that is there' test -d "$(store_real "$out")"
 
 
+# A relative directory is recorded absolutely: sgit list, remote and the rest
+# run from anywhere, and a relative path would name a different place from
+# each of them -- or nothing, which list reports as a lost working tree.
+mkdir -p "$TRASH/rel"
+# $TRASH may carry a doubled slash from $TMPDIR; the recorded path will not.
+REL=$(cd "$TRASH/rel" && pwd)
+( cd "$TRASH/rel" && sgit init sub/../proj ) >/dev/null 2>&1 || fail 'init with a relative path' 'exited non-zero'
+rid=$(id_of "$REL/proj")
+is 'a relative working tree path is recorded absolutely' "$REL/proj" \
+	"$(git config -f "$SGIT_HOME/repos/$rid/config" --get sgit.workdir)"
+( cd "$REL/proj" && sgit remote add origin "$REL/nowhere.git" ) >/dev/null 2>&1
+listing=$( cd "$REL/proj" && sgit list 2>&1 )
+case "$listing" in
+*"$rid"*gone*) fail 'list from inside the tree still finds it' "$listing" ;;
+*"$REL/proj"*) pass 'list from inside the tree still finds it' ;;
+*) fail 'list from inside the tree still finds it' "$listing" ;;
+esac
+
+# Stores written before that fix hold a relative path; list says how to repair
+# it rather than offering a restore that would build a second tree.
+git config -f "$SGIT_HOME/repos/$rid/config" sgit.workdir proj
+listing=$(sgit list 2>&1)
+case "$listing" in
+*"$rid"*'relative path'*) pass 'list flags a relative path from an older init' ;;
+*) fail 'list flags a relative path from an older init' "$listing" ;;
+esac
+sgit --id "$rid" config --repo sgit.workdir "$REL/proj" 2>/dev/null
+listing=$(sgit list 2>&1)
+case "$listing" in
+*"$rid"*gone* | *"$rid"*relative*) fail 'config sgit.workdir repairs it' "$listing" ;;
+*"$REL/proj"*) pass 'config sgit.workdir repairs it' ;;
+*) fail 'config sgit.workdir repairs it' "$listing" ;;
+esac
+
 test_summary

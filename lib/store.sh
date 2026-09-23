@@ -182,6 +182,9 @@ store_list_ids() {
 #   ok       it is there and still belongs to this repository
 #   missing  a path was recorded but nothing is at it any more
 #   foreign  something is there, but it is not this shadow working tree
+#   relative the recorded path is relative, as `sgit init <dir>` once wrote
+#            it; what it names depends on where sgit is run, so it is not
+#            looked at
 #   none     none was recorded -- created with --no-workdir, so it may well
 #            exist on another machine where sgit cannot see it
 #
@@ -194,6 +197,13 @@ store_workdir_state() {
 		STORE_WD_STATE=none
 		return 0
 	fi
+	case "$STORE_WD" in
+	/*) ;;
+	*)
+		STORE_WD_STATE=relative
+		return 0
+		;;
+	esac
 	if [ ! -d "$STORE_WD/.git" ]; then
 		STORE_WD_STATE=missing
 		return 0

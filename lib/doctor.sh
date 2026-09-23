@@ -293,6 +293,10 @@ doctor_repo() {
 		d_note "recreate it with: sgit restore $id [<dir>]"
 		d_note 'only what reached the shadow repository comes back'
 		;;
+	relative)
+		d_warn "the working tree is recorded as the relative path $STORE_WD, which means something different from every directory"
+		d_note "record where it really is: sgit --id $id config --repo sgit.workdir <absolute path>"
+		;;
 	foreign)
 		d_warn "$STORE_WD is no longer this shadow working tree"
 		d_note 'it may have been replaced; sgit restore would refuse to overwrite it'
